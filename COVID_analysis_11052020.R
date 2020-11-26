@@ -1,0 +1,634 @@
+###############################################################################
+# -----------------                                                           #
+#|Table of Contents|           (Search #1, #2, etc to skip to section)        #
+# -----------------                                                           #
+#1 Load libraries                                                             #
+#2 Load data sources                                                          #
+#3 Clean Dr. Daniel's Data                                                    #
+#4 Prep data for a Preliminary PCA                                            #
+#5 Run Preliminary PCA                                                        #
+#6 Prep and merge Image Data                                                  #
+#7 Prep run final PCAs w/ img Vars                                            #
+###############################################################################
+
+#1 #############################################################################
+# Load libraries
+library(readxl)
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(data.table)
+library(factoextra)
+library(corrplot)
+library(FactoMineR)
+library(factoextra)
+library(FactoInvestigate)
+library(tableone)
+library(survival)
+library(survminer)
+library(epiDisplay)
+
+#epiDisplay loads MASS which overwrites select, use command to force back to dplyr
+select <- dplyr::select
+
+#alternatively could use the below:
+library(conflicted)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+
+
+#2 #############################################################################
+# Load data sources
+
+# Load Dr. Daniel's data
+danielsMAR <- read.csv("Z:/users/abe_neuro/COVID19_MAR/Daniels_MAR.csv", fileEncoding = 'UTF-8-BOM', na.strings = c('#NULL!', ''))
+# Load image description data (Arterys Listing tab)
+imgData <- read.csv("Z:/users/abe_neuro/covid/covid_20201026_abe.csv", fileEncoding = 'UTF-8-BOM', na.strings = c('?', ''))
+# Load image severity data
+mRaleData <- read.csv("Z:/users/abe_neuro/COVID19_MAR/avemRALE_MRN_11112020.csv", fileEncoding = 'UTF-8-BOM', na.strings = c('NA', ''))
+
+#3 #############################################################################
+# Clean Dr. Daniel's DatA
+
+# Create a version of ID with leading 0s in character format
+danielsMAR$id_str <- sprintf("%08d", danielsMAR$id)
+danielsMAR <- relocate(danielsMAR, id_str, .after = id)
+
+# Convert numeric dates to a date class/format
+dateVars <- c("dob", "coviddatefirst", "covidpdate", "doedb", "doeda", "doab", "doaa", "icudate", "intubatedbdate", "intubatedadate", "indexstartdate", "indexenddate", "dod")
+danielsMAR <- danielsMAR %>% mutate_at(dateVars, dmy)
+
+# Change "sex" which is 1=male or 2=female, to "female" which is 0=no or 1=yes
+danielsMAR <- danielsMAR %>% mutate(female=recode(sex, `1`=0, `2`=1)) %>% relocate(female, .after = sex)
+
+# General categorization of variables into list (will help construct subsets later)
+basicVars <- c("id", "id_str", "coviddatefirst", "transfer", "transferother")
+demogVars <- c("female", "dob", "covidage", "covidage10", "hcwo", "ethnicity_MAR", "insurance")
+comorbVars <- c("Asthma_PT", "COPD_PT", "CKD_PT", "Diabetes_PT", "Prediabetes_PT", "Hypertension_PT", "Tobacco_PT", "HIV_PT", "Obesity_PT", "CirrLiv_PT", "IschVasc_PT", "Stroke_PT", "CF_PT", "HFailure_PT", "CVD_PT")
+comorbVars2 <- c("tobfreq", "tobyrs", "etoh", "dm", "dmtype", "dmmed", "dminsulin", "dmoral", "osa", "copd", "asthma", "cad", "chf", "af", "stroke", "tia", "pad", "cvsurg", "cabg", "cabgyr", "pci", "pciyr", "valve", "pm", "icd", "abltn", "tx", "txyr", "strokesurg", "pvdsurg", "pvdsurgyr", "ckd", "cancer", "cancertype", "cirrhosis", "hiv", "immunodx", "transplantany", "transorgan", "chemo", "imab", "infect", "inflam", "inflamtype", "neuro", "gi") 
+comorbVars3 <- c("asthma2", "copd2", "ckd2", "diabetes2", "prediabetes2", "htn2", "tob2", "hiv2", "obesity2", "CirrLiv2", "IschVasc2", "stroke2", "CF2", "HF2", "CVD2", "obesity2b", "tobcurr")
+vitalVars <- c("bp", "pulse", "osat", "temp", "fever", "pregnant", "sbp1st", "sbphigh", "sbplow", "dbp1st", "dbphigh", "dbplow", "pulse1st", "pulsehigh", "pulselow", "osat1st", "osathigh", "osatlow", "tempadmit")
+edVars <- c("edb", "doedb", "eda", "doeda")
+admitVars <- c("admitb", "doab", "admita", "doaa", "los")
+icuVars <- c("icu", "icudate", "losicu")
+icuRxVars <- c("ventb", "venta", "intubatedb", "intubatedbdate", "intubateda", "intubatedadate", "ecmob", "ecmoa", "crrtb", "crrta")
+miscVars <- c("indexstartdate", "indexenddate")
+dispoVars <- c("dispo", "death", "dod")
+medicationVars <- c("acei", "aceiprior", "arb", "arbprior", "asa", "asaprior", "ibuprof", "ibuprofprior", "nsaid", "nsaidprior", "med", "medhtn", "ccb", "bb", "diuretic", "aldo", "bpother", "medchol", "medstatin", "bldthin", "chloro", "chloroinpt", "hydroxy", "hydroxyinpt", "azithro", "azithroinpt", "remdesivir", "solumedrol", "prednisone", "predpast", "sirolimus", "sirolimuspast")
+medicationdoseVars <- c("aceidose", "aceipriordose", "arbdose", "arbpriordose", "asadose", "asapriordose", "ibuprofdose", "ibuprofpriordose", "nsaiddose", "nsaidpriordose")
+medicationVars2 <- c("aceieverp", "arbeverp", "asaeverp", "ibuprofeverp", "nsaideverp", "acearb", "bpmedother")
+labVars <- c("bnp", "bnpp", "hstrop", "hstropref", "procalc", "ddimer", "hscrp", "crp", "gfr", "creat", "bun", "sodium", "pot", "alb", "ast", "alt", "ldh", "ferritin", "wbc", "rdw", "lymph", "anc", "hgb", "hct", "plt", "inr", "ptt", "flua", "flub")
+labVars2 <- c("lgBNPP", "lgtrop", "trop99s", "trop99", "BNPPyn", "BNPyn", "BNPany")
+echoecgVars <- c("echodate", "lavi", "rvddbasal", "rvddmid", "lvidd", "lvids", "ivcd", "trvel", "pap", "eeprimeratio", "lvef", "ecgdate", "vr", "ar", "qrs", "qtc", "qt", "raxis", "taxis")
+miscfinalVars <- c("echo2", "vent", "intubated", "ecmo", "crrt", "admit", "ED", "admitcovid", "valid", "cvdLD", "icu2", "severe", "severei", "admitvalid", "severecovid", "severevalid", "cadLD", "cvdreg", "cvdhfLD", "cvdhfReg", "cvdafLD", "cvdafreg")
+
+# Slim our data down to include only some of the groups above (get rid of some columns with large amounts of missing data)
+# For example, the "sp" variables are drug names, but very rarely have this
+# Dose amounts are in text format, some times mg, some times tablet, variation within same class of drug, too granular and too few non-NA values for our purposes
+# Days certain things added not very useful and data is sparse
+startData <- danielsMAR %>% select(
+  all_of(basicVars), all_of(demogVars), all_of(comorbVars3), all_of(vitalVars), all_of(medicationVars), 
+  all_of(labVars), all_of(echoecgVars), all_of(miscfinalVars), all_of(edVars), all_of(admitVars), 
+  all_of(icuVars), all_of(dispoVars), all_of(miscVars)
+  )
+na_count <-sapply(danielsMAR, function(y) sum(length(which(is.na(y)))))
+na_count <- data.frame(na_count)
+#na_count
+write.csv(na_count,"Z:\\users\\abe_neuro\\RProjects\\NAcount.csv", row.names = TRUE)
+
+
+#4 #############################################################################
+# Prep data for PCA
+pcaData <- select(startData, -id, #don't need id and id_str, so drop one
+                  -bp, -pulse, -osat, -temp, -fever, #removing these vital stats, as mostly captured in vital1st, overly redundant
+                  -dob, -covidage10, #redundant with covidage
+                  -flua, -flub, #too many missing
+                  # may need to combine hscrp and crp somehow, and somehow combine BNP and BNPP (tho not comparable...)
+                  # consider removing ldh, ferritin (too many missing)
+                  #-vent, -intubated, -ecmo, -crrt, #implies in ICU (may add back if looking at only ICU patients)
+                  -admit, -ED, -admitcovid, -valid, -icu2, -admitvalid, #ICU
+                  -severe, -severei, -severecovid, -severevalid, #Not sure how these are decided
+                  -cvdLD, -cadLD, -cvdreg, -cvdhfLD, -cvdhfReg, -cvdafLD, -cvdafreg, #Need to find out what these are, likely some manually validated comorbidity measures
+                  -edb, -doedb, -eda, -doeda, -admita, -doaa, -los, -icu, -icudate, -losicu, -dispo, -death, -dod, #outcomes
+                  -chloro, -chloroinpt, -hydroxyinpt, -predpast, -sirolimuspast, -CF2 #All 0s (no variance)
+)
+
+# Make ethnicity numeric categories (following HCUP numbers)
+ethnicity_map <- c("White" = 1, "Black" = 2, "Hispanic" = 3, "Asian" = 4, "Middle_Eastern" = 5, "Other_Background" = 6, "Unknown" = 9)
+pcaData$ethnicity_MAR <- ethnicity_map[pcaData$ethnicity_MAR]
+# Make insurance numeric categories (made my own number scheme)
+insurance_map <- c("NA" = 9, "Commerical" = 1, "Medicare" = 2, "Medicare Managed Care" = 3, "Medicaid - California" = 4, "Medicaid - Out of State" = 4, "Medicaid Managed Care" = 5, "County Medical Services" = 6, "Workers Compensation" = 7, "Other Government" = 8)
+pcaData$insurance <- insurance_map[pcaData$insurance]
+# Set missing insurance data to 9 (Unknown)
+pcaData$insurance[is.na(pcaData$insurance)] <- 9
+# Make the date numeric so PCA commands can run on them
+pcaData$coviddatefirst <- as.numeric(pcaData$coviddatefirst)
+# Make id_str the index or row name
+rownames(pcaData) <- pcaData$id_str
+pcaData <- select(pcaData, -id_str)
+
+# Evaluate pcaData
+str(pcaData)
+summary(pcaData)
+
+# Confirm no zero'ed columns
+pcaData_zero <- pcaData %>% summarise(across(where(is.numeric), sum,na.rm=TRUE))
+pcaData_zero
+
+# Alternative data structure where instead of letting the FactoMineR package impute
+# misisng to the mean, we can set missing to -1 (not sure this is valid)
+pcaData2 <- pcaData
+pcaData2[is.na(pcaData2)] <- -1
+#a <- sort(colnames(pcaData))
+#b <- sort(colnames(pcaData2))
+#a[a %in% b]
+#a[!(a %in% b)]
+#b[!(b %in% a)]
+
+#5 #############################################################################
+# Run PCA
+
+# Additional things to consider, should I drop ethnicity? should I drop insurance? These are categorical
+# Currently imputing missing by the mean, but there are quite a lot of missing when it comes to lab values
+
+# Base R PCA analysis, but requires me to get rid of missings
+#res.prcomp1 <- prcomp(pcaData, scale = TRUE)
+#fviz_eig(res.prcomp1)
+
+# Using FactoMineR package
+res.pca <- PCA(pcaData, graph = FALSE)
+respcaalt <- PCA(pcaData2, graph = FALSE)
+
+# Eigenvalues
+eig.val <- get_eigenvalue(res.pca)
+eig.val
+# Results for Variables
+# $coord = Coorindates, $contrib = Contributions to the PCs, $cos2 = quality of representation
+res.var <- get_pca_var(res.pca)
+# Results for individuals
+# $coord = Coorindates, $contrib = Contributions to the PCs, $cos2 = quality of representation
+res.ind <- get_pca_ind(res.pca)
+
+# Scree Plot (Top 15, remove ncp arg if want all)
+fviz_eig(res.pca, ncp=15, linecolor='red')
+
+# Variable plot
+fviz_pca_var(res.pca, col.var = "contrib", gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), repel = TRUE)
+
+# Individual plot
+plot(res.pca, choix = "ind", autoLab = "yes")
+
+# Biplot
+fviz_pca_biplot(res.pca, repel = TRUE, col.var = "#2E9FDF", col.ind = "#696969")
+
+# Contributions of variables to PCX (axes = X)
+fviz_contrib(res.pca, choice = "var", axes = 1, top = 15)
+# Original (shown to Albert)
+fviz_contrib(res.pca2, choice = "var", axes = 1, top = 15)
+# Same idea as above, but after removed zero'ed columns and some other small changes to variables
+fviz_contrib(respcaalt, choice = "var", axes = 1, top = 15)
+
+fviz_contrib(res.pca, choice = "var", axes = 3, top = 15)
+fviz_contrib(res.pca, choice = "var", axes = 4, top = 15)
+fviz_contrib(res.pca, choice = "var", axes = 5, top = 15)
+fviz_contrib(res.pca, choice = "var", axes = 5, top = 15)
+res.pca$var
+
+#Below doesn't work for some reason (would generate an automated report/analysis of the PCA)
+#FactoInvestigate
+Investigate(res.pca, document = "pdf_document")
+
+#6 #############################################################################
+# Prep and merge Image Data
+
+# imgData corresponds to the Arterys Listing tab from 1026 with some modifications
+# - Propagate accession number into all rows (was missing from some duplicate phonetic rows)
+# - Created a modality column via Excel
+
+# Clean arterys listing data
+imgData2 <- imgData %>% 
+  select(id_str, accn, phonetic_id, unique_phonetic, study_desc, studyDate, modality, covid_any, available) %>% # get rid of extra columns
+  arrange(id_str, phonetic_id, is.na(covid_any), is.na(available)) %>%  # sort so more complete row on top
+  distinct(id_str, phonetic_id, .keep_all = TRUE) %>% # keep one
+  mutate_at(c("studyDate", "covid_any"), mdy) %>% # convert these to date format
+  arrange(id_str, studyDate, phonetic_id) %>% # sort by mrn, study date, and phonetic id
+  select(-available) # get rid of available since don't need it
+
+# Reduce columns in mRALE data $1513x2, remove duplicate rows
+mRaleData2 <- mRaleData %>% distinct(unique_phonetic, mean_mRALE, .keep_all = FALSE)
+
+# Merge in severity data
+img_mRale_merge = left_join(imgData2, mRaleData2, by='unique_phonetic')
+
+# Check for duplications
+imgData2 %>% count(unique_phonetic, sort=TRUE) %>% filter(n>1) 
+mRaleData2 %>% count(unique_phonetic, sort=TRUE) %>% filter(n>1) 
+img_mRale_merge %>% count(unique_phonetic, sort=TRUE) %>% filter(n>1)
+dupmerge <- img_mRale_merge %>% count(phonetic_id, sort=TRUE) %>% filter(n>1) 
+# although there are not duplicate unique_phonetics, there are duplicate phonetics, but we are not attaching the mRALE incorrectly at least
+img_mRale_merge %>% filter(phonetic_id %in% dupmerge$phonetic_id) %>% arrange(phonetic_id)
+
+daniels_imgmRale_merge <- left_join(startData, img_mRale_merge, by='id_str')
+daniels_imgmRale_merge$study_indexstart_deltaT <- difftime(daniels_imgmRale_merge$studyDate, daniels_imgmRale_merge$indexstartdate, units = 'days')
+daniels_imgmRale_merge$study_indexend_deltaT <- difftime(daniels_imgmRale_merge$studyDate, daniels_imgmRale_merge$indexenddate, units = 'days')
+daniels_imgmRale_merge$study_icudate_deltaT <- difftime(daniels_imgmRale_merge$studyDate, daniels_imgmRale_merge$icudate, units = 'days')
+daniels_imgmRale_merge <- daniels_imgmRale_merge %>% arrange(id_str, study_indexstart_deltaT)
+
+# temporarily reduce # of columns for readability
+tempMerge1 <- daniels_imgmRale_merge %>% select(id_str, unique_phonetic, accn, phonetic_id, study_desc, modality, studyDate, indexstartdate, indexenddate, icudate, study_indexstart_deltaT, study_icudate_deltaT, study_indexend_deltaT, mean_mRALE)
+
+#Run some numbers real quick:
+tempMerge2 <- tempMerge1 %>% 
+  #mutate(indexenddate = replace_na(indexenddate, ymd("2020-09-08"))) %>%
+  group_by(id_str) %>% 
+  filter(!is.na(phonetic_id)) %>% # Go from 826 to 599 without an attached phonetic_id
+  filter(as.numeric(study_indexstart_deltaT)>-7) %>% # dropping studies that are more than 7 days away from indexstart, 599 -> 533
+  filter(as.numeric(study_icudate_deltaT)<0 | is.na(icudate)) #dropping studies that are after date of ICU admission 533 -> 480
+length(unique(tempMerge2$id_str))
+
+tempMerge3 <- tempMerge1 %>% filter(!is.na(phonetic_id)) %>% filter(modality=="XR") %>% group_by(id_str)
+length(unique(tempMerge3$id_str))
+
+XRstudies <- tempMerge2 %>% filter(modality=="XR")
+length(unique(XRstudies$id_str))
+XRstudies_count <- XRstudies %>% count(id_str)
+summary(XRstudies_count$n)
+hist(XRstudies_count$n, breaks=c(1:max(XRstudies_count$n)), main="Distribution of # of CXRs per patient", xlab="No. of CXRs", ylab="No. of Patients", xlim=c(0,55))
+axis(1, at=seq(0, 55, by=5))
+
+str(tempMerge2)
+
+inclusion_list <- c(826, 599, 533, 480, 448)
+exclusion_label <- c("No imaging study \nassociated with MRN", 
+                     "Only studies more than \n7 days before index start date", 
+                     "Only studies after \nICU admission",
+                     "Patients without Xrays (CT only)")
+inclusion_label <- c("Has at least 1 study \nin Arterys-Listing \nassociated with MRN",
+                     "Has studies after 7 days \nbefore index start date", 
+                     "Has studies before ICU admission \nor never admitted to ICU",
+                     "Remaining after filtering for XR only")
+
+flowgraph2 <- PRISMAstatement::flow_exclusions(
+  incl_counts = inclusion_list,
+  total_label = "Total unique patients",
+  incl_labels = inclusion_label,
+  excl_labels = exclusion_label,
+  height = 4800,
+  width = 4800)
+
+flowgraph2
+
+# Bring in mRale variables (1st, low, high) with respective studyDate and phonetic_id
+mralevars_merge <- tempMerge1 %>% 
+  filter(studyDate>=indexstartdate-1, studyDate<=indexenddate, modality!='CT', grepl("SPINE", study_desc)==FALSE) %>%
+  arrange(id_str, studyDate) %>%
+  group_by(id_str) %>%
+  mutate(mrale1st = first(mean_mRALE), pid_mrale1st = first(phonetic_id), studyD_mrale1st = first(studyDate)) %>% # 1st mRale with associated phonetic/studyDate
+  ungroup(id_str)
+mralevars_merge <- mralevars_merge %>%
+  filter(studyDate>=indexstartdate-1, studyDate<=indexenddate, modality!='CT', grepl("SPINE", study_desc)==FALSE) %>%
+  arrange(id_str, desc(mean_mRALE), studyDate) %>%
+  group_by(id_str) %>%
+  slice(1) %>%
+  mutate(mralehigh = mean_mRALE, pid_mralehigh = phonetic_id, studyD_mralehigh = studyDate) %>%
+  select(id_str, mralehigh, pid_mralehigh, studyD_mralehigh) %>%
+  left_join(mralevars_merge, by='id_str') %>%
+  relocate(c(mralehigh, pid_mralehigh, studyD_mralehigh), .after = studyD_mrale1st)
+mralevars_merge <- mralevars_merge %>%
+  filter(studyDate>=indexstartdate-1, studyDate<=indexenddate, modality!='CT', grepl("SPINE", study_desc)==FALSE) %>%
+  arrange(id_str, mean_mRALE, studyDate) %>%
+  group_by(id_str) %>%
+  slice(1) %>%
+  mutate(mralelow = mean_mRALE, pid_mralelow = phonetic_id, studyD_mralelow = studyDate) %>%
+  select(id_str, mralelow, pid_mralelow, studyD_mralelow) %>%
+  left_join(mralevars_merge, by='id_str') %>%
+  relocate(c(mralelow, pid_mralelow, studyD_mralelow), .after = studyD_mralehigh)
+
+# Define a severity over time function
+severity_over_time <- function(sev_high, sev_start, date_high, date_start){
+  delta_sev <- sev_high - sev_start
+  delta_time <- as.numeric(difftime(date_high, date_start, units = 'days'))
+  sev_over_time <- delta_sev / delta_time
+  if(is.na(sev_high) | is.na(sev_start)){
+    sev_over_time <- NA
+  }else if(as.numeric(date_high) == as.numeric(date_start) | as.numeric(date_high) < as.numeric(date_start)){
+    sev_over_time <- 0
+  }
+  return(sev_over_time)
+}
+
+mraleVars <- c("mrale1st", "pid_mrale1st", "studyD_mrale1st", "mralehigh", "pid_mralehigh", "studyD_mralehigh", "mralelow", "pid_mralelow", "studyD_mralelow", "sev_over_time")
+mralevars_merge <- mralevars_merge %>%
+  mutate(sev_over_time = severity_over_time(mralehigh, mrale1st, studyD_mralehigh, studyD_mrale1st)) %>%
+  slice(1) %>%
+  select("id_str", mraleVars) %>%
+  ungroup("id_str")
+
+# Want to merge in our variables into our start Data so we are back to 1 row per MRN
+finalMerge <- left_join(startData, mralevars_merge, by="id_str")
+write.csv(finalMerge,"Z:\\users\\abe_neuro\\RProjects\\DanielsData_mRaleMerged_20201111.csv", row.names = TRUE)
+
+#7 #############################################################################
+# Prep Final PCAs
+
+# Now we need to define our individual populations
+everyoneDF <- finalMerge
+ethnicity_map <- c("White" = 1, "Black" = 2, "Hispanic" = 3, "Asian" = 4, "Middle_Eastern" = 5, "Other_Background" = 6, "Unknown" = 9)
+everyoneDF$ethnicity_MAR <- ethnicity_map[everyoneDF$ethnicity_MAR]
+# Make insurance numeric categories (made my own number scheme)
+insurance_map <- c("NA" = 9, "Commerical" = 1, "Medicare" = 2, "Medicare Managed Care" = 3, "Medicaid - California" = 4, "Medicaid - Out of State" = 4, "Medicaid Managed Care" = 5, "County Medical Services" = 6, "Workers Compensation" = 7, "Other Government" = 8)
+everyoneDF$insurance <- insurance_map[everyoneDF$insurance]
+# Set missing insurance data to 9 (Unknown)
+everyoneDF$insurance[is.na(everyoneDF$insurance)] <- 9
+# Make the date numeric so PCA commands can run on them
+everyoneDF$coviddatefirst <- as.numeric(everyoneDF$coviddatefirst)
+# Make id_str the index or row name
+rownames(everyoneDF) <- everyoneDF$id_str
+everyoneDF <- select(everyoneDF, -id_str, -id,
+                     -bp, -pulse, -osat, -temp, -fever, #removing these vital stats, as mostly captured in vital1st, overly redundant
+                     -dob, -covidage10, #redundant with covidage
+                     -flua, -flub, #too many missing
+                     -severe, -severei, -severecovid, -severevalid, #Not sure how these are decided    
+                     -edb, -doedb, -eda, -doeda, -admita, -doaa, -admitb, -doab, -los, -icu, -icudate, -losicu, -dispo, -death, -dod, #outcomes
+                     -valid, -admitvalid, # not sure what these are, maybe the people that were individually looked at?
+                     -chloro, -chloroinpt, -hydroxyinpt, -predpast, -sirolimuspast, -CF2, #All 0s (no variance)
+                     -echodate, -ecgdate, -rvddbasal, -rvddmid, -lvidd, -lvids, -trvel, -eeprimeratio, #All missing
+                     #-cvdLD, -cadLD, -cvdreg, -cvdhfLD, -cvdhfReg, -cvdafLD, -cvdafreg, 
+                     -indexstartdate, -indexenddate, -pid_mrale1st, -studyD_mrale1st, -pid_mralehigh, -studyD_mralehigh, -pid_mralelow, -studyD_mralelow
+                     )
+
+admitDF <- everyoneDF %>%
+  filter(admit==1)
+admitcovidDF <- everyoneDF %>%
+  filter(admitcovid==1)
+edonlyDF <- everyoneDF %>%
+  filter(ED==1 & admit==0) %>%
+  # Need to remove some columns with nearly all missing values to run the PCA
+  select(-bnp, -bnpp, -hstrop, -hstropref, -procalc, -ddimer, -hscrp, -crp, -gfr, -ldh, -ferritin, -inr, -ptt)
+edDF <- everyoneDF %>%
+  filter(ED==1)
+icuonlyDF <- everyoneDF %>%
+  filter(icu2==1)
+
+everyoneDF <- select(everyoneDF, -admit, -ED, -admitcovid, -icu2)
+
+nrow(everyoneDF)
+nrow(admitDF)
+nrow(admitcovidDF)
+nrow(edonlyDF)
+nrow(edDF)
+nrow(icuonlyDF)
+
+# How found missing values to remove
+#na_count.ed <-sapply(edonlyDF, function(y) sum(length(which(is.na(y)))))
+#na_count.ed <- data.frame(na_count.ed)
+#na_count.ed
+
+# Run PCAs
+everyonePCA <- PCA(everyoneDF, graph = FALSE)
+admitPCA <- PCA(admitDF, graph = FALSE)
+admitcovidPCA <- PCA(admitcovidDF, graph = FALSE)
+edonlyPCA <- PCA(edonlyDF, graph = FALSE)
+edPCA <- PCA(edDF, graph = FALSE)
+icuonlyPCA <- PCA(icuonlyDF, graph = FALSE)
+
+
+Investigate(everyonePCA, file="Z:/users/abe_neuro/covid/everyonePCA_Investigate.rmd", document = "pdf_document")
+Investigate(admitPCA, file="Z:/users/abe_neuro/covid/admitPCA_Investigate.rmd", document = "pdf_document")
+Investigate(edonlyPCA, file="Z:/users/abe_neuro/covid/edonlyPCA_Investigate.rmd", document = "pdf_document")
+Investigate(edPCA, file="Z:/users/abe_neuro/covid/edPCA_Investigate.rmd", document = "pdf_document")
+Investigate(icuonlyPCA, file="Z:/users/abe_neuro/covid/icuonlyPCA_Investigate.rmd", document = "pdf_document")
+
+#Plots for everyonePCA
+
+fviz_eig(everyonePCA, ncp=15, linecolor='red', main="Everyone") + theme(plot.title = element_text(hjust = 0.5))
+plot(everyonePCA$eig[1:(length(everyonePCA$eig)/3),3], ylab = "Cumulative percent of Variance Explained", ylim=c(0,100), xlab = "Principal Component", type = 'b', main="Everyone")
+fviz_pca_var(everyonePCA, axes=c(1,2), col.var = "contrib", gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), repel = TRUE, select.var = list(contrib = 30), title="Variables - Everyone PCA") + theme(plot.title = element_text(hjust = 0.5))
+fviz_pca_var(everyonePCA, axes=c(2,3), col.var = "contrib", gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), repel = TRUE, select.var = list(contrib = 30), title="Variables - Everyone PCA") + theme(plot.title = element_text(hjust = 0.5))
+fviz_pca_var(everyonePCA, axes=c(3,4), col.var = "contrib", gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), repel = TRUE, select.var = list(contrib = 30), title="Variables - Everyone PCA") + theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(everyonePCA, choice = "var", axes = 1, top = 15, title="Everyone: Contribution of vars to PC1")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(everyonePCA, choice = "var", axes = 2, top = 15, title="Everyone: Contribution of vars to PC2")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(everyonePCA, choice = "var", axes = 3, top = 15, title="Everyone: Contribution of vars to PC3")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(everyonePCA, choice = "var", axes = 4, top = 15, title="Everyone: Contribution of vars to PC4")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(everyonePCA, choice = "var", axes = 5, top = 15, title="Everyone: Contribution of vars to PC5")+ theme(plot.title = element_text(hjust = 0.5))
+
+#Plots for admitPCA (Admits only)
+fviz_eig(admitPCA, ncp=15, linecolor='red', main="Admitted") + theme(plot.title = element_text(hjust = 0.5)) #Scree Plot
+plot(admitPCA$eig[1:(length(admitPCA$eig)/3),3], ylab = "Cumulative percent of Variance Explained", ylim=c(0,100), xlab = "Principal Component", type = 'b', main="Admitted")
+fviz_pca_var(admitPCA, axes=c(1,2), col.var = "contrib", gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), repel = TRUE, select.var = list(contrib = 30), title="Variables - Admitted PCA") + theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(admitPCA, choice = "var", axes = 1, top = 15, title="Admitted: Contribution of vars to PC1")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(admitPCA, choice = "var", axes = 2, top = 15, title="Admitted: Contribution of vars to PC2")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(admitPCA, choice = "var", axes = 3, top = 15, title="Admitted: Contribution of vars to PC3")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(admitPCA, choice = "var", axes = 4, top = 15, title="Admitted: Contribution of vars to PC4")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(admitPCA, choice = "var", axes = 5, top = 15, title="Admitted: Contribution of vars to PC5")+ theme(plot.title = element_text(hjust = 0.5))
+
+#Plots for edonlyPCA (At ED, but not admitted)
+fviz_eig(edonlyPCA, ncp=15, linecolor='red', main="ED Only") + theme(plot.title = element_text(hjust = 0.5)) #Scree Plot
+plot(edonlyPCA$eig[1:(length(edonlyPCA$eig)/3),3], ylab = "Cumulative percent of Variance Explained", ylim=c(0,100), xlab = "Principal Component", type = 'b', main="ED Only (not Admit)")
+fviz_pca_var(edonlyPCA, axes=c(1,2), col.var = "contrib", gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), repel = TRUE, select.var = list(contrib = 30), title="Variables - ED Only PCA") + theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(edonlyPCA, choice = "var", axes = 1, top = 15, title="ED Only: Contribution of vars to PC1")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(edonlyPCA, choice = "var", axes = 2, top = 15, title="ED Only: Contribution of vars to PC2")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(edonlyPCA, choice = "var", axes = 3, top = 15, title="ED Only: Contribution of vars to PC3")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(edonlyPCA, choice = "var", axes = 4, top = 15, title="ED Only: Contribution of vars to PC4")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(edonlyPCA, choice = "var", axes = 5, top = 15, title="ED Only: Contribution of vars to PC5")+ theme(plot.title = element_text(hjust = 0.5))
+
+#Plots for icuonlyPCA (anyone in ICU)
+fviz_eig(icuonlyPCA, ncp=15, linecolor='red', main="ICU Only") + theme(plot.title = element_text(hjust = 0.5)) #Scree Plot
+plot(icuonlyPCA$eig[1:(length(icuonlyPCA$eig)/3),3], ylab = "Cumulative percent of Variance Explained", ylim=c(0,100), xlab = "Principal Component", type = 'b', main="ICU Only")
+fviz_contrib(icuonlyPCA, choice = "var", axes = 1, top = 15, title="ICU Only: Contribution of vars to PC1")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(icuonlyPCA, choice = "var", axes = 2, top = 15, title="ICU Only: Contribution of vars to PC2")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(icuonlyPCA, choice = "var", axes = 3, top = 15, title="ICU Only: Contribution of vars to PC3")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(icuonlyPCA, choice = "var", axes = 4, top = 15, title="ICU Only: Contribution of vars to PC4")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(icuonlyPCA, choice = "var", axes = 5, top = 15, title="ICU Only: Contribution of vars to PC5")+ theme(plot.title = element_text(hjust = 0.5))
+
+#Plots for admitcovidPCA (Admits only)
+fviz_eig(admitcovidPCA, ncp=15, linecolor='red', main="Admitted") + theme(plot.title = element_text(hjust = 0.5)) #Scree Plot
+plot(admitcovidPCA$eig[1:(length(admitcovidPCA$eig)/3),3], ylab = "Cumulative percent of Variance Explained", ylim=c(0,100), xlab = "Principal Component", type = 'b', main="Admitted")
+fviz_pca_var(admitcovidPCA, axes=c(1,2), col.var = "contrib", gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), repel = TRUE, select.var = list(contrib = 30), title="Variables - Admitted PCA") + theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(admitcovidPCA, choice = "var", axes = 1, top = 15, title="Admitted: Contribution of vars to PC1")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(admitcovidPCA, choice = "var", axes = 2, top = 15, title="Admitted: Contribution of vars to PC2")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(admitcovidPCA, choice = "var", axes = 3, top = 15, title="Admitted: Contribution of vars to PC3")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(admitcovidPCA, choice = "var", axes = 4, top = 15, title="Admitted: Contribution of vars to PC4")+ theme(plot.title = element_text(hjust = 0.5))
+fviz_contrib(admitcovidPCA, choice = "var", axes = 5, top = 15, title="Admitted: Contribution of vars to PC5")+ theme(plot.title = element_text(hjust = 0.5))
+
+summary(everyoneDF$mrale1st)
+
+#Create some tables now that have variables you are interested
+IncludedData <- finalMerge
+IncludedData <- IncludedData %>% mutate(after_july1 = if_else(coviddatefirst>=mdy("07-01-2020"),1,0))
+
+myVars <- c("covidage", "ethnicity_MAR", "insurance", "pregnant", "after_july1", 
+            "asthma2", "copd2", "ckd2", "diabetes2", "prediabetes2", "htn2", "tob2", "hiv2", "obesity2", "CirrLiv2", "IschVasc2", "stroke2", "CF2", "HF2", "CVD2", "obesity2b", "tobcurr",
+            "sbp1st", "sbphigh", "sbplow", "dbp1st", "dbphigh", "dbplow", "pulse1st", "pulsehigh", "pulselow", "osat1st", "osathigh", "osatlow", "tempadmit",
+            "acei", "aceiprior", "arb", "arbprior", "asa", "asaprior", "ibuprof", "ibuprofprior", "nsaid", "nsaidprior", "med", "medhtn", "ccb", "bb", "diuretic", "aldo", "bpother", "medchol", "medstatin", "bldthin", "remdesivir", "solumedrol", "prednisone",
+            "bnp", "bnpp", "procalc", "ddimer", "hscrp", "crp", "gfr", "creat", "bun", "sodium", "pot", "alb", "ast", "alt", "ldh", "ferritin", "wbc", "rdw", "lymph", "anc", "hgb", "hct", "plt", "inr", "ptt",
+            #"lgBNPP", "lgtrop", "trop99s", "trop99", "BNPPyn", "BNPyn", "BNPany",
+            "mrale1st", "mralehigh", "mralelow", "sev_over_time",
+            "cadLD", "cvdreg", "cvdhfLD", "cvdhfReg", "cvdafLD", "cvdafreg",
+            "lavi", "ivcd", "pap", "lvef", "vr", "ar", "qrs", "qtc", "qt", "raxis", "taxis",
+            "echo2", "vent", "intubated", "ecmo", "crrt", 
+            "ED", "admit", "admitcovid", "valid", "admitvalid", "icu2",
+            "dispo", "death"
+            )
+
+
+fVars <- c("ethnicity_MAR", "insurance", "pregnant", "after_july1",
+           "asthma2", "copd2", "ckd2", "diabetes2", "prediabetes2", "htn2", "tob2", "hiv2", "obesity2", "CirrLiv2", "IschVasc2", "stroke2", "CF2", "HF2", "CVD2", "obesity2b", "tobcurr",
+           "acei", "aceiprior", "arb", "arbprior", "asa", "asaprior", "ibuprof", "ibuprofprior", "nsaid", "nsaidprior", "med", "medhtn", "ccb", "bb", "diuretic", "aldo", "bpother", "medchol", "medstatin", "bldthin", "remdesivir", "solumedrol", "prednisone",
+           #"lgBNPP", "lgtrop", "trop99s", "trop99", "BNPPyn", "BNPyn", "BNPany",
+           "cadLD", "cvdreg", "cvdhfLD", "cvdhfReg", "cvdafLD", "cvdafreg",
+           "echo2", "vent", "intubated", "ecmo", "crrt", 
+           "ED", "admit", "admitcovid", "valid", "admitvalid", "icu2",
+           "dispo", "death"
+)
+
+tab1 <- CreateTableOne(vars = myVars, factor = fVars, data = IncludedData, includeNA = TRUE)
+tab1_bydeath <- CreateTableOne(vars = myVars, factor = fVars, strata = "death" , data = IncludedData, includeNA = TRUE)
+tab1_byicu2 <- CreateTableOne(vars = myVars, factor = fVars, strata = "icu2" , data = IncludedData, includeNA = TRUE)
+#print(tab1, showAllLevels = TRUE, formatOptions = list(big.mark = ","))
+#print(tab1_bydeath, showAllLevels = TRUE, formatOptions = list(big.mark = ","))
+tab1csv <- print(tab1, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE)
+tab1_bydeathcsv <- print(tab1_bydeath, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE)
+tab1_byicu2csv <- print(tab1_byicu2, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE)
+## Save to a CSV file
+write.csv(tab1csv, file = "Z:\\users\\abe_neuro\\RProjects\\Table1.csv")
+write.csv(tab1_bydeathcsv, file = "Z:\\users\\abe_neuro\\RProjects\\Table1_bydeath.csv")
+write.csv(tab1_byicu2csv, file = "Z:\\users\\abe_neuro\\RProjects\\Table1_byICU.csv")
+
+na_count_mergedData <-sapply(IncludedData, function(y) sum(length(which(is.na(y)))))
+na_count_mergedData <- data.frame(na_count_mergedData)
+#na_count
+write.csv(na_count_mergedData,"Z:\\users\\abe_neuro\\RProjects\\NAcount_onMergedData.csv", row.names = TRUE)
+
+# May want to start looking at the subset of people admitted for COVID
+Included_AdmitCovid <- IncludedData %>% filter(admitcovid==1)
+ac_tab1 <- CreateTableOne(vars = myVars, factor = fVars, data = Included_AdmitCovid, includeNA = TRUE)
+ac_tab1_bydeath <- CreateTableOne(vars = myVars, factor = fVars, strata = "death" , data = Included_AdmitCovid, includeNA = TRUE)
+ac_tab1_byicu2 <- CreateTableOne(vars = myVars, factor = fVars, strata = "icu2" , data = Included_AdmitCovid, includeNA = TRUE)
+ac_tab1csv <- print(ac_tab1, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE)
+ac_tab1_bydeathcsv <- print(ac_tab1_bydeath, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE)
+ac_tab1_byicu2csv <- print(ac_tab1_byicu2, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE)
+## Save to a CSV file
+write.csv(ac_tab1csv, file = "Z:\\users\\abe_neuro\\RProjects\\ac_Table1.csv")
+write.csv(ac_tab1_bydeathcsv, file = "Z:\\users\\abe_neuro\\RProjects\\ac_Table1_bydeath.csv")
+write.csv(ac_tab1_byicu2csv, file = "Z:\\users\\abe_neuro\\RProjects\\ac_Table1_byICU.csv")
+
+na_count_mergedData <-sapply(Included_AdmitCovid, function(y) sum(length(which(is.na(y)))))
+na_count_mergedData <- data.frame(na_count_mergedData)
+#na_count
+write.csv(na_count_mergedData,"Z:\\users\\abe_neuro\\RProjects\\ac_NAcount_onMergedData.csv", row.names = TRUE)
+
+# May want to start looking at the subset of people admitted to ICU
+Included_AdmitCovid_ICU <- IncludedData %>% filter(admitcovid==1, icu2==1)
+icu_tab1 <- CreateTableOne(vars = myVars, factor = fVars, data = Included_AdmitCovid_ICU, includeNA = TRUE)
+icu_tab1_bydeath <- CreateTableOne(vars = myVars, factor = fVars, strata = "death" , data = Included_AdmitCovid_ICU, includeNA = TRUE)
+icu_tab1csv <- print(icu_tab1, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE)
+icu_tab1_bydeathcsv <- print(icu_tab1_bydeath, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE)
+## Save to a CSV file
+write.csv(icu_tab1csv, file = "Z:\\users\\abe_neuro\\RProjects\\icu_Table1.csv")
+write.csv(icu_tab1_bydeathcsv, file = "Z:\\users\\abe_neuro\\RProjects\\icu_Table1_bydeath.csv")
+
+na_count_mergedData <-sapply(Included_AdmitCovid_ICU, function(y) sum(length(which(is.na(y)))))
+na_count_mergedData <- data.frame(na_count_mergedData)
+#na_count
+write.csv(na_count_mergedData,"Z:\\users\\abe_neuro\\RProjects\\icu_NAcount_onMergedData.csv", row.names = TRUE)
+
+
+# Look at people who presented to ED
+Included_ED <- IncludedData %>% filter(ED==1)
+
+# Creating survival variables
+Included_ED <- Included_ED %>% 
+  #Create time_to_icu
+  mutate(time_to_icu = as.numeric(difftime(icudate, indexstartdate, units = 'days'))) %>%
+  mutate(time_to_icu = ifelse(time_to_icu==-1,0,time_to_icu)) %>% 
+  #Create outcome variable, twodayicu(0/1)
+  mutate(twodayicu = ifelse(time_to_icu<=2.0,1,0)) %>%
+  mutate(twodayicu = replace_na(twodayicu, 0)) %>%
+  #Clean indexenddate
+  mutate(indexenddate2 = indexenddate) %>%
+  mutate(indexenddate2 = coalesce(indexenddate2, icudate, indexstartdate)) %>%
+  #Create time_to_death
+  mutate(time_to_death = as.numeric(difftime(dod, indexstartdate, units='days'))) %>%
+  mutate(time_to_studyend = as.numeric(difftime(indexenddate2, indexstartdate, units='days'))) %>%
+  mutate(futime = coalesce(time_to_icu, time_to_death, time_to_studyend))
+
+summary(Included_ED$covidage)
+
+Included_ED <- Included_ED %>% mutate(age_cat = case_when(covidage < 35 ~ 'Under 35',
+                                                        covidage >= 35 & covidage < 45 ~ '35-44',
+                                                        covidage >= 45 & covidage < 55 ~ '45-54',
+                                                        covidage >= 55 & covidage < 65 ~ '55-64',
+                                                        covidage >= 65 & covidage < 75 ~ '65-74',
+                                                        covidage >= 75 ~ '75+'))
+
+summary(factor(Included_ED$age_cat))
+summary(Included_ED$covidage)
+
+# Confirm the below are 0 (did not die or reach study end before went to ICU (only for people who went to ICU tho))
+sum(Included_ED$time_to_death<Included_ED$time_to_icu, na.rm=TRUE)
+sum(Included_ED$time_to_studyend<Included_ED$time_to_icu, na.rm=TRUE)
+
+# Checking some stats on survival time, futime has been adjusted to censor for death
+summary(Included_ED$time_to_icu)
+summary(Included_ED$time_to_death)
+summary(Included_ED$time_to_studyend)
+summary(Included_ED$futime)
+
+# Create survival function
+f1 <- survfit(Surv(futime, icu) ~ 1, data = Included_ED)
+f2 <- survfit(Surv(futime, icu) ~ admitcovid, data = Included_ED)
+f3 <- survfit(Surv(futime, icu) ~ age_cat, data = Included_ED)
+
+# @ 2 days, survival = 89.6% so basically 11.4% admitted to ICU
+surv_median(f1)
+
+ggsurvplot(
+  fit = f1, 
+  xlab = "Days", 
+  ylab = "Percent not admitted to ICU",
+  xlim = c(0,30),
+  break.time.by = 2,
+  risk.table = T,
+  ggtheme = theme_minimal(),
+  risk.table.y.text.col = T,
+  risk.table.y.text = FALSE
+)
+summary(f1)
+
+ggsurvplot(
+  fit = f3, 
+  xlab = "Days", 
+  ylab = "Percent not admitted to ICU",
+  xlim = c(0,30),
+  break.time.by = 2,
+  risk.table = T,
+  pval = T,
+  #conf.int = T,
+  ggtheme = theme_minimal(),
+  risk.table.y.text.col = T,
+  risk.table.y.text = FALSE
+)
+Included_ED %>% filter(!is.na(mrale1st)) %>% group_by(twodayicu) %>% 
+  summarize(n=n(), meanmrale=mean(mrale1st, na.rm=T))
+Included_ED %>% filter(is.na(mrale1st)) %>% group_by(twodayicu) %>% 
+  summarize(n=n(), meanmrale=mean(mrale1st, na.rm=T))
+
+logit1 <- glm(twodayicu ~ covidage + female + obesity2b + aceiprior + cvdhfLD + sbp1st + dbp1st + pulse1st + osat1st + tempadmit + creat + hgb + wbc + anc + mrale1st + sev_over_time, family = binomial, data = Included_ED)
+logistic.display(logit1)
+
+#Extract MRNs for people with BNPP data
+BNPPDF <- IncludedData %>% filter(!is.na(bnpp))
+nrow(BNPPDF)
+colnames(BNPPDF)
+dplyr::count(BNPPDF, cvdhfLD, sort=TRUE)
+#Grab just columns we need
+BNPPDF <- dplyr::select(BNPPDF, id_str, coviddatefirst, cvdhfLD, indexstartdate, indexenddate)
+BNPPDF <- left_join(BNPPDF, imgData2, by='id_str')
+BNPPDF <- arrange(BNPPDF, id_str, studyDate)
+# Arbitrarily set end date to end of data collection (9/8/2020), several of these patients have since been discharged or died
+BNPPDF <- BNPPDF %>% mutate(indexenddate = replace_na(indexenddate, ymd("2020-09-08")))
+BNPPDF <- BNPPDF %>% filter(between(studyDate, indexstartdate, indexenddate))
+BNPPDF <- BNPPDF %>% filter(modality=="XR")
+BNPPDF <- BNPPDF %>% group_by(id_str) %>% slice(1)
+write.csv(BNPPDF, file = "Z:\\users\\abe_neuro\\RProjects\\BNPPDF_sample.csv")

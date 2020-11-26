@@ -1,0 +1,236 @@
+---
+title: "COVID_MCA_PCA"
+author: "Meagan Rubel"
+date: "11/21/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(Factoshiny)
+library(readr)
+library(dplyr)
+library(magrittr)
+library(FactoMineR)
+library(FactoInvestigate)
+
+#This df is both categorical and numeric/continuous 
+DanielsData_mRaleMerged_20201111_MAR <- read_csv("C:/Users/Meagan/OneDrive - UC San Diego/covid19/DanielsData_mRaleMerged_20201111_MAR.csv", 
+     col_types = cols(coviddatefirst = col_date(format = "%m/%d/%Y"), 
+         dob = col_date(format = "%m/%d/%Y"),
+                        doedb = col_date(format = "%m/%d/%Y") , 
+                        doeda = col_date(format = "%m/%d/%Y"),
+                        doab = col_date(format = "%m/%d/%Y"),
+                        doaa = col_date(format = "%m/%d/%Y"),
+                        icudate = col_date(format = "%m/%d/%Y"),
+                        indexstartdate = col_date(format = "%m/%d/%Y"), 
+                        indexenddate = col_date(format = "%m/%d/%Y"),
+                        studyD_mrale1st = col_date(format = "%m/%d/%Y"), 
+                        studyD_mralehigh = col_date(format = "%m/%d/%Y"),
+                        studyD_mralelow = col_date(format = "%m/%d/%Y")))
+
+#This df is numeric/continuous only; treats categorical as numeric
+cov_UCSD <- DanielsData_mRaleMerged_20201111_MAR
+
+#This df is categorical only- numbers are factors
+cov_ucsd_cat <- DanielsData_mRaleMerged_20201111_MAR %>% 
+  dplyr::select(id, female, ethnicity_MAR, insurance, ends_with("_disease"), ends_with("_drug"), 
+                ends_with("_druggroup"), ends_with("_drugpast"), pregnant, echo2, vent, intubated, ecmo, admit, 
+                ED, admitcovid, valid, cvdLD, icu2, severe, severei, admitvalid, severecovid, severevalid, cadLD,
+                cvdreg, cvdhfLD, cvdhfReg,	cvdafLD, cvdafreg, edb, eda, admitb, admita, icu,
+                death) 
+
+cols <- c("female", "ethnicity_MAR", "insurance", "pregnant", "echo2", "vent", "intubated", "ecmo", "admit",
+          "ED", "admitcovid", "valid", "cvdLD", "icu2", "severe", "severei", "admitvalid", "severecovid",
+          "severevalid", "cadLD","cvdreg", "cvdhfLD", "cvdhfReg",	"cvdafLD", "cvdafreg", "edb", "eda", "admitb", 
+          "admita", "icu","death")
+
+cov_ucsd_cat %<>%
+       mutate_each_(funs(factor(.)),cols) #turn everything into a factor save id 
+
+
+cols2 <- cov_ucsd_cat %>% select(ends_with("_disease"), ends_with("_drug"), 
+                ends_with("_druggroup"), ends_with("_drugpast")) %>% names()
+
+cov_ucsd_cat %<>%
+       mutate_each_(funs(factor(.)),cols2)
+
+#cov_ucsd_cat$id <- as.numeric(cov_ucsd_cat$id)
+
+cov_ucsd_cat$id <- as.numeric(cov_ucsd_cat$id)
+
+res.shiny <- MCAshiny(cov_ucsd_cat)
+
+res.pca <- PCA(cov_UCSD, quali.sup = 1, quanti.sup = 2:177, graph = FALSE)
+
+res.shiny <- PCAshiny(cov_UCSD, quali.sup = 1, quanti.sup = 2:177)
+```
+
+```{r Abe's PCA work}
+#3 #############################################################################
+# Clean Dr. Daniel's DatA
+#This df is both categorical and numeric/continuous 
+DanielsData_mRaleMerged_20201111_MAR <- read_csv("C:/Users/Meagan/OneDrive - UC San Diego/covid19/DanielsData_mRaleMerged_20201111_MAR.csv", 
+     col_types = cols(coviddatefirst = col_date(format = "%m/%d/%Y"), 
+         dob = col_date(format = "%m/%d/%Y"),
+                        doedb = col_date(format = "%m/%d/%Y") , 
+                        doeda = col_date(format = "%m/%d/%Y"),
+                        doab = col_date(format = "%m/%d/%Y"),
+                        doaa = col_date(format = "%m/%d/%Y"),
+                        icudate = col_date(format = "%m/%d/%Y"),
+                        indexstartdate = col_date(format = "%m/%d/%Y"), 
+                        indexenddate = col_date(format = "%m/%d/%Y"),
+                        studyD_mrale1st = col_date(format = "%m/%d/%Y"), 
+                        studyD_mralehigh = col_date(format = "%m/%d/%Y"),
+                        studyD_mralelow = col_date(format = "%m/%d/%Y")))
+
+danielsMAR <- DanielsData_mRaleMerged_20201111_MAR
+# Create a version of ID with leading 0s in character format
+danielsMAR$id_str <- sprintf("%08d", danielsMAR$id)
+danielsMAR <- relocate(danielsMAR, id_str, .after = id)
+
+# Convert numeric dates to a date class/format
+dateVars <- c("dob", "coviddatefirst", "covidpdate", "doedb", "doeda", "doab", "doaa", "icudate", "intubatedbdate", "intubatedadate", "indexstartdate", "indexenddate", "dod")
+danielsMAR <- danielsMAR %>% mutate_at(dateVars, dmy)
+
+# Change "sex" which is 1=male or 2=female, to "female" which is 0=no or 1=yes
+danielsMAR <- danielsMAR %>% mutate(female=recode(sex, `1`=0, `2`=1)) %>% relocate(female, .after = sex)
+
+# General categorization of variables into list (will help construct subsets later)
+basicVars <- c("id", "id_str", "coviddatefirst", "transfer", "transferother")
+
+demogVars <- c("female", "dob", "covidage", "covidage10", "hcwo", "ethnicity_MAR", "insurance")
+
+#comorbVars <- c("Asthma_PT", "COPD_PT", "CKD_PT", "Diabetes_PT", "Prediabetes_PT", "Hypertension_PT", "Tobacco_PT", "HIV_PT", "Obesity_PT", "CirrLiv_PT", "IschVasc_PT", "Stroke_PT", "CF_PT", "HFailure_PT", "CVD_PT")
+comorbVars <- danielsMAR %>% select(ends_with("_disease"), disease_total) %>% names()
+
+comorbVars2 <- c("tobfreq", "tobyrs", "etoh", "dm", "dmtype", "dmmed", "dminsulin", "dmoral", "osa", "copd", "asthma", "cad", "chf", "af", "stroke", "tia", "pad", "cvsurg", "cabg", "cabgyr", "pci", "pciyr", "valve", "pm", "icd", "abltn", "tx", "txyr", "strokesurg", "pvdsurg", "pvdsurgyr", "ckd", "cancer", "cancertype", "cirrhosis", "hiv", "immunodx", "transplantany", "transorgan", "chemo", "imab", "infect", "inflam", "inflamtype", "neuro", "gi") 
+
+#comorbVars3 <- c("asthma2", "copd2", "ckd2", "diabetes2", "prediabetes2", "htn2", "tob2", "hiv2", "obesity2", "CirrLiv2", "IschVasc2", "stroke2", "CF2", "HF2", "CVD2", "obesity2b", "tobcurr")
+
+vitalVars <- c("bp", "pulse", "osat", "temp", "fever", "pregnant", "sbp1st", "sbphigh", "sbplow", "dbp1st", "dbphigh", "dbplow", "pulse1st", "pulsehigh", "pulselow", "osat1st", "osathigh", "osatlow", "tempadmit")
+
+edVars <- c("edb", "doedb", "eda", "doeda")
+
+admitVars <- c("admitb", "doab", "admita", "doaa", "los")
+
+icuVars <- c("icu", "icudate", "losicu")
+
+icuRxVars <- c("ventb", "venta", "intubatedb", "intubatedbdate", "intubateda", "intubatedadate", "ecmob", "ecmoa", "crrtb", "crrta")
+
+miscVars <- c("indexstartdate", "indexenddate")
+
+dispoVars <- c("dispo", "death", "dod")
+
+medicationVars <- danielsMAR %>% select(ends_with("_drug"), drug_total) %>% names()
+
+pastmedicationVars <- danielsMAR %>% select(ends_with("_drugpast")) %>% names()
+
+medicationgroupVars <- danielsMAR %>% select(ends_with("_druggroup")) %>% names()
+
+#medicationdoseVars <- c("aceidose", "aceipriordose", "arbdose", "arbpriordose", "asadose", "asapriordose", "ibuprofdose", "ibuprofpriordose", "nsaiddose", "nsaidpriordose")
+#medicationVars2 <- c("aceieverp", "arbeverp", "asaeverp", "ibuprofeverp", "nsaideverp", "acearb", "bpmedother")
+
+labVars <- c("bnp", "bnpp", "hstrop", "hstropref", "procalc", "ddimer", "hscrp", "crp", "gfr", "creat", "bun", "sodium", "pot", "alb", "ast", "alt", "ldh", "ferritin", "wbc", "rdw", "lymph", "anc", "hgb", "hct", "plt", "inr", "ptt", "flua", "flub")
+#labVars2 <- c("lgBNPP", "lgtrop", "trop99s", "trop99", "BNPPyn", "BNPyn", "BNPany")
+
+echoecgVars <- c("echodate", "lavi", "rvddbasal", "rvddmid", "lvidd", "lvids", "ivcd", "trvel", "pap", "eeprimeratio", "lvef", "ecgdate", "vr", "ar", "qrs", "qtc", "qt", "raxis", "taxis")
+
+miscfinalVars <- c("echo2", "vent", "intubated", "ecmo", "crrt", "admit", "ED", "admitcovid", "valid", "cvdLD", "icu2", "severe", "severei", "admitvalid", "severecovid", "severevalid", "cadLD", "cvdreg", "cvdhfLD", "cvdhfReg", "cvdafLD", "cvdafreg")
+
+# Slim our data down to include only some of the groups above (get rid of some columns with large amounts of missing data)
+# For example, the "sp" variables are drug names, but very rarely have this
+# Dose amounts are in text format, some times mg, some times tablet, variation within same class of drug, too granular and too few non-NA values for our purposes
+# Days certain things added not very useful and data is sparse
+startData <- danielsMAR %>% select(
+  all_of(basicVars), all_of(demogVars), all_of(vitalVars), all_of(medicationVars), 
+  all_of(labVars), all_of(echoecgVars), all_of(miscfinalVars), all_of(edVars), all_of(admitVars), 
+  all_of(icuVars), all_of(dispoVars), all_of(miscVars)
+  )
+na_count <-sapply(danielsMAR, function(y) sum(length(which(is.na(y)))))
+na_count <- data.frame(na_count)
+#na_count
+write.csv(na_count,"Z:\\users\\abe_neuro\\RProjects\\NAcount.csv", row.names = TRUE)
+
+
+#4 #############################################################################
+# Prep data for PCA
+pcaData <- startData %>% dplyr::select(-id, #don't need id and id_str, so drop one
+                  -bp, -pulse, -osat, -temp, -fever, #removing these vital stats, as mostly captured in vital1st, overly redundant
+                  -dob, -covidage10, #redundant with covidage
+                  -flua, -flub, #too many missing
+                  # may need to combine hscrp and crp somehow, and somehow combine BNP and BNPP (tho not comparable...)
+                  # consider removing ldh, ferritin (too many missing)
+                  #-vent, -intubated, -ecmo, -crrt, #implies in ICU (may add back if looking at only ICU patients)
+                  -admit, -ED, -admitcovid, -valid, -icu2, -admitvalid, #ICU
+                  -severe, -severei, -severecovid, -severevalid, #Not sure how these are decided
+                  -cvdLD, -cadLD, -cvdreg, -cvdhfLD, -cvdhfReg, -cvdafLD, -cvdafreg, #Need to find out what these are, likely some manually validated comorbidity measures
+                  -edb, -doedb, -eda, -doeda, -admita, -doaa, -los, -icu, -icudate, -losicu, -dispo, -death, -dod #outcomes
+)
+
+# Make ethnicity numeric categories (following HCUP numbers)
+ethnicity_map <- c("White" = 1, "Black" = 2, "Hispanic" = 3, "Asian" = 4, "Middle_Eastern" = 5, "Other_Background" = 6, "Unknown" = 9)
+pcaData$ethnicity_MAR <- ethnicity_map[pcaData$ethnicity_MAR]
+# Make insurance numeric categories (made my own number scheme)
+insurance_map <- c("NA" = 9, "Commerical" = 1, "Medicare" = 2, "Medicare Managed Care" = 3, "Medicaid - California" = 4, "Medicaid - Out of State" = 4, "Medicaid Managed Care" = 5, "County Medical Services" = 6, "Workers Compensation" = 7, "Other Government" = 8)
+
+# Set missing insurance data to 9 (Unknown)
+pcaData$insurance[is.na(pcaData$insurance)] <- 9
+# Make the date numeric so PCA commands can run on them
+pcaData$coviddatefirst <- as.numeric(pcaData$coviddatefirst)
+# Make id_str the index or row name
+rownames(pcaData) <- pcaData$id_str
+pcaData <- pcaData %>% dplyr::select(-id_str)
+
+# Evaluate pcaData
+str(pcaData)
+summary(pcaData)
+
+# Confirm no zero'ed columns
+pcaData_zero <- pcaData %>% summarise(across(where(is.numeric), sum,na.rm=TRUE))
+pcaData_zero
+
+# Alternative data structure where instead of letting the FactoMineR package impute
+# misisng to the mean, we can set missing to -1 (not sure this is valid)
+pcaData2 <- pcaData
+pcaData2[is.na(pcaData2)] <- -1
+#a <- sort(colnames(pcaData))
+#b <- sort(colnames(pcaData2))
+#a[a %in% b]
+#a[!(a %in% b)]
+#b[!(b %in% a)]
+
+#Find which columns are numeric
+sub_num = pcaData[sapply(pcaData, is.numeric)]
+#5 #############################################################################
+# Run PCA
+
+# Additional things to consider, should I drop ethnicity? should I drop insurance? These are categorical
+# Currently imputing missing by the mean, but there are quite a lot of missing when it comes to lab values
+
+# Base R PCA analysis, but requires me to get rid of missings
+#res.prcomp1 <- prcomp(pcaData, scale = TRUE)
+#fviz_eig(res.prcomp1)
+
+# Using FactoMineR package
+res.pca <- PCA(sub_num, graph = FALSE)
+respcaalt <- PCA(pcaData2, graph = FALSE)
+
+# Eigenvalues
+eig.val <- get_eigenvalue(res.pca)
+eig.val
+# Results for Variables
+# $coord = Coorindates, $contrib = Contributions to the PCs, $cos2 = quality of representation
+res.var <- get_pca_var(res.pca)
+# Results for individuals
+# $coord = Coorindates, $contrib = Contributions to the PCs, $cos2 = quality of representation
+res.ind <- get_pca_ind(res.pca)
+
+# Scree Plot (Top 15, remove ncp arg if want all)
+fviz_eig(res.pca, ncp=15, linecolor='red')
+
+res.shiny <- PCAshiny(sub_num)
+res.shiny <- Factoshiny(sub_num)
