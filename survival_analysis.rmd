@@ -1,0 +1,1859 @@
+---
+title: "Kaplain-Meier (KM), Odds Ratio, and other COVID19 analyses"
+author: "MAR"
+date: "8/21/2020"
+output:
+  png_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Libraries
+```{r survival}
+library(survival)
+library(survminer)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(ggpubr)
+library(gridExtra)
+library(kableExtra)
+```
+## Metadata Manipulation
+```{r metadata manipulation}
+options(stringsAsFactors = TRUE) #global change
+
+mrale <- read_csv("/media/lorax/users/marubel/08_covid19/mrale.csv")
+mrale <- mrale[, -c(4:15)]
+droplist <- c("Juhastis","Fefifo","Idiskag","Ceekiqua","Caparu","Poquita","Bembemug")
+mrale_check <- mrale[!(mrale$phoneticID %in% droplist),] #removes training/validation phonetic IDS from list, gives total number of xrays scored by radiologists sans these, should be 1472
+
+MRN_to_phonetic <- read_csv("MRN_to_phonetic.csv", 
+     col_types = cols(study_date = col_date(format = "%m/%d/%Y")))
+
+MRN_to_phonetic$`admission date` <- NULL
+
+c19_pos_MAR <- read_csv("/media/lorax/users/marubel/08_covid19/c19_pos_MAR.csv", 
+     col_types = cols(`admission date` = col_date(format = "%m/%d/%Y"), 
+         `discharge date` = col_date(format = "%m/%d/%Y"), 
+         dob = col_date(format = "%m/%d/%Y"), 
+         `icu admission date` = col_date(format = "%m/%d/%Y"), 
+         `icu discharge date` = col_date(format = "%m/%d/%Y"), 
+         `admission date` = col_date(format = "%m%d%Y"),
+         intubation = col_date(format = "%m/%d/%Y"), 
+         mortality = col_date(format = "%m/%d/%Y"), 
+         `onset/presentation date` = col_date(format = "%m/%d/%Y"), 
+         `rt-pcr pos date` = col_date(format = "%m/%d/%Y")))
+
+#for first_xray (next code block) calculate days from first xray to mortality (will have to go date to date; lubridate!)
+#for first_xray, calculate days from first xray to intubation
+#for hospitalization, redefine as "days to discharge" to censor when patients die
+
+c19_phonetic <- merge(c19_pos_MAR, MRN_to_phonetic, by = "mrn")
+
+c19 <- c19_phonetic %>%
+  dplyr::select(mrn, phonetic_ids, `hospital duration`, intubation, mortality, gender, ethnicity,`icu duration (days)`, dob, study_date, `admission date`, `xray relative to admisison`, `discharge date`) %>%
+  dplyr::mutate(prolonged_hospitalization = `hospital duration` > 14) %>%
+  dplyr::rename(hospital_duration = `hospital duration`, sex = gender,
+    icu_duration = `icu duration (days)`, phoneticID = phonetic_ids, admission_date = `admission date`, xray_relative_admission = `xray relative to admisison`, discharge_date = `discharge date`)
+
+c19_metadata <- dplyr::left_join(c19, mrale, by = "phoneticID")
+
+c19_metadata <- c19_metadata %>% 
+  dplyr::mutate(intubation_TF = ifelse(is.na(intubation), FALSE, TRUE))
+
+c19_metadata <- c19_metadata %>% 
+  dplyr::mutate(mortality_TF = ifelse(is.na(mortality), FALSE, TRUE))
+
+c19_metadata <- c19_metadata %>% 
+  dplyr::mutate(sex_binary = ifelse(sex == "Male", 0, 1))
+
+c19_metadata <- c19_metadata %>%
+  dplyr::mutate(age = floor(decimal_date(admission_date) - decimal_date(dob))) 
+
+c19_metadata <- c19_metadata %>% 
+  dplyr::mutate(mRALE_bin = ifelse(mRALE_score >= 0 & mRALE_score < 5, 1, ifelse(mRALE_score > 4 & mRALE_score < 10, 2, 3))) 
+
+c19_metadata <- c19_metadata %>% 
+    dplyr::mutate(low_high = ifelse(mRALE_score <= 4, 1, ifelse(mRALE_score >= 5, 2, NA))) 
+
+c19_metadata$hospital_duration[606:630] <- 37
+
+c19_metadata <- c19_metadata %>% 
+    dplyr::mutate(low_high = ifelse(mRALE_score <= 4, 1, ifelse(mRALE_score >= 5, 2, NA))) 
+
+c19_metadata <- c19_metadata %>% 
+  dplyr::mutate(mRALE_quartile = ifelse(mRALE_score >= 0 & mRALE_score <= 6, 1, ifelse(mRALE_score >= 7 & mRALE_score <= 12, 2, ifelse(mRALE_score >= 13 & mRALE_score <= 18, 3, 4))))
+
+c19_metadata$mrn <- as.factor(c19_metadata$mrn)
+
+c19_metadata$xray_relative_admission <- as.numeric(c19_metadata$xray_relative_admission)
+
+c19_metadata$xray_relative_intubation <- with(c19_metadata, difftime(intubation,study_date,units="days") )
+
+c19_metadata$xray_relative_mortality <- with(c19_metadata, difftime(mortality,study_date,units="days") )
+
+c19_metadata$xray_relative_discharge <- with(c19_metadata, difftime(discharge_date,study_date,units="days") )
+
+c19_metadata$xray_relative_intubation <- abs(c19_metadata$xray_relative_intubation) #computes absolute val, negative vals now pos
+#If patient never has event, should be way to document this
+
+c19_metadata$xray_relative_discharge <- abs(c19_metadata$xray_relative_discharge) #computes absolute val, negative vals now pos
+
+c19_metadata$xray_relative_mortality <- abs(c19_metadata$xray_relative_mortality) #computes absolute val, negative vals now pos
+
+c19_metadata$xray_relative_admission <- abs(c19_metadata$xray_relative_admission) #computes absolute val, negative vals now pos
+                               
+c19_metadata$mRALE_score[1157] <- 24
+
+```
+## First X-ray Cohort
+```{r}
+#For each series of mrns, filter phonetic ID with xray relative to admission that is the smallest number 
+c19_firstxray <- c19_metadata
+
+c19_firstxray <- c19_firstxray %>%
+  dplyr::filter(xray_relative_admission <=3) %>%
+  dplyr::arrange(mrn, xray_relative_admission) %>%
+  dplyr::group_by(mrn) %>%  
+  dplyr::slice(1) 
+
+c19_firstxray %>% 
+  dplyr::filter(hospital_duration >40) %>% 
+  nrow() #Prints number of cases where hosp dur > 40
+  
+  
+c19_firstxray[duplicated(c19_firstxray$mrn),] #evaluated if dups#dim(c19_firstxray[duplicated(c19_firstxray$mrn),]) #number of dups
+
+#c19_firstxray$mortality_TF <- as.factor(c19_firstxray$mortality_TF)
+c19_firstxray$hospital_duration <- as.numeric(c19_firstxray$hospital_duration)
+
+#View(c19_firstxray)
+
+c19_firstxray_noNA <- c19_firstxray %>% 
+  drop_na(mRALE_score) %>%
+  drop_na(mRALE_bin) 
+
+c19_firstxray$discharge_TF <- c19_firstxray$xray_relative_discharge
+
+c19_firstxray$discharge_TF <- as.logical(c19_firstxray$discharge_TF)
+
+c19_firstxray$discharge_TF[1:210] <- T
+
+droplist <- c("Juhastis","Fefifo","Idiskag","Ceekiqua","Caparu","Poquita","Bembemug")
+
+c19_firstxray <- c19_firstxray[!(c19_firstxray$phoneticID %in% droplist),] #removes the 7 phoneticIDs in training/validation from c19_firstxray
+
+#For Abe's hospital admission digging
+
+c19_firstxray_Abe <- c19_firstxray %>% dplyr::select(mrn, hospital_duration) %>% filter(hospital_duration <= 2)
+
+c19_firstxray_Brian <- c19_firstxray %>% dplyr::select(phoneticID)
+
+
+```
+##Make averaged mRALE from rater scores
+```{r, include = FALSE}
+
+#https://www.r-bloggers.com/2018/04/k-is-for-cohens-kappa/
+
+library(rel)  
+
+#load in misha, albert, kate scores and filter for ones that have been scored by >=2 raters
+cohensk_albert <- read_csv("cohensk_albert.csv")
+cohensk_kate <- read_csv("cohensk_kate.csv")
+cohensk_misha <- read_csv("cohensk_misha.csv")
+cohensk_lewis <- read_csv("cohensk_lewis.csv")
+cohensk_seth <- read_csv("cohensk_seth.csv")
+
+cohensk_1 <- full_join(cohensk_albert, cohensk_kate, by = "phonetic_id")
+#cohensk_1 <- cohensk_1 %>% mutate(mRALE_ave = rowMeans(select(cohensk_1, starts_with("mRALE"))))
+cohensk_1 <- cohensk_1 %>% rename(phoneticID = phonetic_id)
+
+cohensk_2 <- full_join(cohensk_albert, cohensk_misha, by = "phonetic_id")
+#cohensk_2 <- cohensk_2 %>% mutate(mRALE_ave = rowMeans(select(cohensk_2, starts_with("mRALE"))))
+cohensk_2 <- cohensk_2 %>% rename(phoneticID = phonetic_id)
+
+cohensk_3 <- full_join(cohensk_misha, cohensk_kate, by = "phonetic_id")
+#cohensk_3 <- cohensk_3 %>% mutate(mRALE_ave = rowMeans(select(cohensk_3, starts_with("mRALE"))))
+cohensk_3 <- cohensk_3 %>% rename(phoneticID = phonetic_id)
+
+cohensk_4 <- full_join(cohensk_lewis, cohensk_albert, by = "phonetic_id")
+#cohensk_4 <- cohensk_4 %>% mutate(mRALE_ave = rowMeans(select(cohensk_4, starts_with("mRALE"))))
+cohensk_4 <- cohensk_4 %>% rename(phoneticID = phonetic_id)
+
+cohensk_5 <- full_join(cohensk_lewis, cohensk_misha, by = "phonetic_id")
+#cohensk_5 <- cohensk_5 %>% mutate(mRALE_ave = rowMeans(select(cohensk_5, starts_with("mRALE"))))
+cohensk_5 <- cohensk_5 %>% rename(phoneticID = phonetic_id)
+
+cohensk_6 <- full_join(cohensk_lewis, cohensk_kate, by = "phonetic_id")
+#cohensk_6 <- cohensk_6 %>% mutate(mRALE_ave = rowMeans(select(cohensk_6, starts_with("mRALE"))))
+cohensk_6 <- cohensk_6 %>% rename(phoneticID = phonetic_id)
+
+cohensk_7 <- full_join(cohensk_seth, cohensk_kate, by = "phonetic_id")
+#cohensk_7 <- cohensk_7 %>% mutate(mRALE_ave = rowMeans(select(cohensk_7, starts_with("mRALE"))))
+cohensk_7 <- cohensk_7 %>% rename(phoneticID = phonetic_id)
+
+cohensk_8 <- full_join(cohensk_seth, cohensk_albert, by = "phonetic_id")
+#cohensk_8 <- cohensk_8 %>% mutate(mRALE_ave = rowMeans(select(cohensk_8, starts_with("mRALE"))))
+cohensk_8 <- cohensk_8 %>% rename(phoneticID = phonetic_id)
+
+cohensk_9 <- full_join(cohensk_seth, cohensk_misha, by = "phonetic_id")
+#cohensk_9 <- cohensk_9 %>% mutate(mRALE_ave = rowMeans(select(cohensk_9, starts_with("mRALE"))))
+cohensk_9 <- cohensk_9 %>% rename(phoneticID = phonetic_id)
+
+cohensk_10 <- full_join(cohensk_seth, cohensk_lewis, by = "phonetic_id")
+#cohensk_9 <- cohensk_9 %>% mutate(mRALE_ave = rowMeans(select(cohensk_9, starts_with("mRALE"))))
+cohensk_10 <- cohensk_10 %>% rename(phoneticID = phonetic_id)
+
+cohensk_1_10_raw <- bind_rows(cohensk_1, cohensk_2, cohensk_3, cohensk_4, cohensk_6, cohensk_7, cohensk_8, cohensk_9, cohensk_10)
+
+cohensk_1_10 <- cohensk_1_10_raw %>% mutate(mRALE_ave = rowMeans(select(., starts_with("mRALE")), na.rm = TRUE))
+
+cohensk_ave <- cohensk_1_10 %>%
+  group_by(phoneticID) %>%
+  summarise_at(vars(mRALE_ave), funs(mean(., na.rm=TRUE))) 
+
+#cohensk_ave[duplicated(cohensk_ave$phoneticID),]
+#avemRALE_MRN <- left_join(c19_metadata, cohensk_ave, by = "phoneticID")
+
+#c19_firstxray <- cohensk_1_10 %>%
+#  #dplyr::filter(mRALE_ave >= 0) %>%
+#  dplyr::select(phoneticID, mRALE_ave) %>% 
+#  dplyr::group_by(phoneticID) %>%  
+#  dplyr::arrange(dplyr::desc(mRALE_ave), phoneticID, by.group = TRUE) %>% View()
+#  dplyr::slice(1)
+
+c19_firstxray <- left_join(c19_firstxray, cohensk_ave, by = "phoneticID")
+
+c19_firstxray[duplicated(c19_firstxray$mrn),] #evaluated if dups#
+dim(c19_firstxray[duplicated(c19_firstxray$mrn),]) #number of dups
+dim(c19_firstxray) #should be 210
+
+#kick out 91-93 dups of Jagustru
+#test <- c19_firstxray %>% arrange(phoneticID) %>% slice(-c(91:93))
+
+
+cohensk_ave_temp <- cohensk_ave %>% rename(phonetic_id = phoneticID)
+ttestmisha <- dplyr::left_join(cohensk_misha, cohensk_ave_temp, by = "phonetic_id")
+
+#y is 0-24, x should be multiple groups
+ggplot(cohensk_1_10  
+, aes(mRALE_misha, mRALE_ave)) +
+        geom_boxplot()
+
+t.test(mRALE_misha ~ mRALE_ave, data = ttestmisha, paired = FALSE)
+```
+
+## Low/high mRALE intubation KM curves (first xray)
+```{r c19 first xray to intubation survival curves}
+#use high_low to visualize
+
+#View(c19_firstxray)
+
+#censor lets say is 30 days after x-ray if they have not been intubated yet.
+c19_firstxray$censor_intubation <- c19_firstxray$xray_relative_intubation
+c19_firstxray$censor_intubation <- c19_firstxray$xray_relative_intubation %>% replace_na(60)
+
+fit <- survfit(Surv(censor_intubation, intubation_TF) ~ low_high, data = c19_firstxray)
+
+
+ggsurvplot(fit, data = c19_firstxray,
+           title = "Freedom from Intubation for 206 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+          surv.median.line = "hv",# Add median survival lines
+          #cumcensor = TRUE,  #ogical value specifying whether to show or not the table of the cumulative number of censoring. Default is FALSE.
+          #legend.title = "mRALE Bin",               # Change legend titles
+           legend.labs = c("Low: mRALE <=4", "High: mRALE >= 5"),  # Change legend labels
+           #legend.labs = c("Mortality = F", "Mortality = T"),
+           xlab = "Days from first x-ray", font.main = c(16, "plain", "black"),
+           ylab = "Freedom from Intubation",
+           palette = "jco",                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = TRUE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+)
+
+```
+
+## Low/high mRALE hospitalization KM curves (first xray)
+```{r c19 first xray to hospitalization survival curves}
+#use high_low to visualize
+#Relabel axes: X should be time to discharge
+
+fit <- survfit(Surv(xray_relative_discharge, discharge_TF) ~ low_high, data = c19_firstxray)
+ 
+ggsurvplot(fit, data = c19_firstxray,
+           title = "Length of stay for 206 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+          surv.median.line = "hv",            # Add median survival lines
+           #legend.title = "mRALE Bin",               # Change legend titles
+           legend.labs = c("1: Low (mRALE <= 4)", "2: High (mRALE >= 5)"),  # Change legend labels
+           #legend.labs = c("Mortality = F", "Mortality = T"),
+           xlab = "Days from first x-ray", font.main = c(16, "plain", "black"),
+           ylab = "Length of stay probability",
+           palette = "jco",                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = TRUE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+)
+
+#albert_table_2 <- c19_firstxray %>% dplyr::select(mrn, xray_relative_mortality, xray_relative_discharge, censor_hosp_duration)
+
+c19_firstxray$xray_relative_discharge
+```
+## Low/high mRALE mortality KM curves (first xray)
+```{r Survival curves for mortality with low high}
+#use high_low to visualize
+
+#View(c19_firstxray)
+
+c19_firstxray$censor_mortality <- c19_firstxray$xray_relative_mortality 
+c19_firstxray$censor_mortality <- c19_firstxray$censor_mortality %>% replace_na(60)
+
+fit <- survfit(Surv(censor_mortality, mortality_TF) ~ low_high, data = c19_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+ggsurvplot(fit, data = c19_firstxray,
+           title = "Survival Probability for 206 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+           surv.median.line = "hv",            # Add median survival lines
+           #legend.title = "mRALE Bin",               # Change legend titles
+           legend.labs = c("1: Low (mRALE <= 4)", "2: High (mRALE >= 5)"),  # Change legend labels
+           #legend.labs = c("Mortality = F", "Mortality = T"),
+           xlab = "Days from first x-ray", font.main = c(16, "plain", "black"),
+           ylab = "Survival Probability",
+           palette = "jco",                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = TRUE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+)
+
+```
+## Quartile mRALE mortality KM curves (first xray)
+```{r Survival curves for mortality with quartile}
+#use mRALE quarties for faceting
+
+#View(c19_firstxray)
+
+c19_firstxray$censor_mortality <- c19_firstxray$xray_relative_mortality 
+c19_firstxray$censor_mortality <- c19_firstxray$censor_mortality %>% replace_na(60)
+
+c19_firstxray <- c19_firstxray %>% 
+  dplyr::mutate(mRALE_ave_quartile = ifelse(mRALE_ave >= 0 & mRALE_ave <= 6, 1, ifelse(mRALE_ave >= 6.01 & mRALE_ave <=12, 2, ifelse(mRALE_ave >= 12.01 & mRALE_ave <=18, 3, 4))))
+
+fit <- survfit(Surv(censor_mortality, mortality_TF) ~ mRALE_ave_quartile, data = c19_firstxray)
+
+g1 <- ggsurvplot(fit,  
+           size = 2.5,
+           #linetype = c('dotted', 'dotdash','solid','dashed'),
+           censor = FALSE, 
+           base_size = 18,
+           #title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.coord = c(30, 0.50), 
+           #pval.method = TRUE,    # Add p-value &  method name
+           ylab = "Likelihood", font.main = c(18, "plain", "black"),
+           xlab = "Time (Days)",
+           font.x = c(18, "plain", "black"),
+           font.y = c(18, "plain", "black"),
+           font.tickslab = c(15, "plain", "black"),
+           surv.median.line = "hv",            # Add median survival lines
+           #legend = c("right"),
+           #font.legend = c(18, "plain","black"),
+           show.legend = FALSE,
+           #legend.labs = c("1: mRALE 0-6", "2: mRALE 7-12", "3: mRALE 13-18", "4: mRALE 18-24"),  # Change legend labels
+          palette = c("red", "orange","blue","purple"),       
+          #palette = 'jco', # Use JCO journal color palette
+          risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE,
+)
+
+res <- pairwise_survdiff(Surv(censor_mortality, mortality_TF) ~ mRALE_ave_quartile, data = c19_firstxray)
+res
+
+res.cox <- coxph(Surv(censor_mortality, mortality_TF) ~ mRALE_quartile, data = c19_firstxray)
+summary(res.cox)   
+
+
+
+```
+
+## Quartile mRALE intubation KM curves (first xray)
+
+```{r}
+
+fit <- survfit(Surv(censor_intubation, intubation_TF) ~ mRALE_ave_quartile, data = c19_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+g2 <- ggsurvplot(fit,  
+           size = 2.5,
+           censor = FALSE, 
+           base.size = 18,
+           #title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.coord = c(15, 0.25), 
+           #pval.method = TRUE,    # Add p-value &  method name
+           ylab = "Likelihood", font.main = c(18, "plain", "black"),
+           xlab = "Time (Days)",
+           break.time.by = 7,
+           font.x = c(18, "plain", "black"),
+           font.y = c(18, "plain", "black"),
+           font.tickslab = c(15, "plain", "black"),
+           surv.median.line = "hv",            # Add median survival lines
+           #legend = c("right"),
+           #font.legend = c(18, "plain","black"),
+           show.legend = FALSE,
+           #legend.labs = c("1: mRALE 0-6", "2: mRALE 7-12", "3: mRALE 13-18", "4: mRALE 18-24"),  # Change legend labels
+           palette = c("red", "orange","blue","purple"),                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE,
+           #linetype = c('dotted', 'dotdash','solid','dashed')
+)
+
+res <- pairwise_survdiff(Surv(censor_intubation, intubation_TF) ~ mRALE_ave_quartile, data = c19_AI_firstxray)
+res
+
+
+res.cox <- coxph(Surv(censor_intubation, intubation_TF) ~ mRALE_quartile_0_1, data = c19_firstxray)
+summary(res.cox)   
+
+```
+
+## Quartile mRALE hospitalization KM curves (first xray)
+```{r}
+#Survival curve for mRALE bin where 0-4 is low and >4 is high
+#Fit survival data using the Kaplan-Meier method (pass surv_object to survfit function)
+
+c19_firstxray <- ungroup(c19_firstxray)
+c19_firstxray$mRALE_score <- as.numeric(c19_firstxray$mRALE_score)
+c19_firstxray$intubation_TF <- as.logical(c19_firstxray$intubation_TF)
+c19_firstxray$prolonged_hospitalization <- as.logical(c19_firstxray$prolonged_hospitalization)
+
+
+fit <- survfit(Surv(xray_relative_discharge, discharge_TF) ~ mRALE_ave_quartile, data = c19_firstxray)
+
+g3 <- ggsurvplot(fit,  
+           size = 2.5,
+           censor = FALSE, 
+           #base.size = 18,
+           #title = "mRALE AI Mean Probability Survival Intubation Length of Stay",
+           pval = TRUE, 
+           pval.coord = c(30, 0.50), 
+           #pval.method = TRUE,    # Add p-value &  method name
+           ylab = "Likelihood", font.main = c(18, "plain", "black"),
+           xlab = "Time (Days)",
+           #break.time.by = 7,
+           font.x = c(18, "plain", "black"),
+           font.y = c(18, "plain", "black"),
+           font.tickslab = c(15, "plain", "black"),
+           surv.median.line = "hv",            # Add median survival lines
+           #legend = c("right"),
+           #font.legend = c(18, "plain","black"),
+           show.legend = FALSE,
+           #legend.title = c("mRALE Score"),
+           #legend.labs = c("0 - 6", "7 - 12", "13 - 18", "19 - 24"),  # Change legend labels
+           palette = c("red", "orange","blue","purple"),                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+           #linetype = c('dotted', 'dotdash','solid','dashed')
+)
+
+surv_median(fit)
+
+g3$plot + 
+  scale_shape_manual(values = c(1,2,3,4))
+
+#summary(fit)
+
+res <- pairwise_survdiff(Surv(xray_relative_discharge, discharge_TF) ~ mRALE_ave_quartile, data = c19_AI_firstxray, p.adjust.method = "BH")
+res
+
+pairwise_survdiff(formula, data, p.adjust.method = "BH", na.action, rho = 0)
+
+res.cox <- coxph(Surv(xray_relative_discharge, discharge_TF) ~ mRALE_quartile_0_1, data = c19_firstxray)
+summary(res.cox)   
+```
+
+
+## AI Metadata manipulation
+```{r AI analysis}
+options(stringsAsFactors = TRUE) #global change
+
+aggregate_predictions_brian <- read_csv("/media/lorax/users/marubel/08_covid19/aggregate_predictions_brian.csv", 
+     col_types = cols(lungs_area_brian = col_number(), 
+         lungs_fractional_area_involved_brian = col_number(), 
+         lungs_max_probability_brian = col_number(), 
+         lungs_mean = col_number()))
+
+aggregate_predictions_brian$lungs_mean <- NULL
+
+new_mean_brian <- 
+  read_csv("/media/lorax/users/marubel/08_covid19/aggregate_preds.csv")
+
+new_mean_brian$maximum <- NULL
+new_mean_brian$pct_area <- NULL
+new_mean_brian <- new_mean_brian %>% dplyr::rename(lungs_mean = mean)
+
+aggregate_predictions_brian <- dplyr::left_join(aggregate_predictions_brian, new_mean_brian, by = "phoneticID") 
+
+c19_metadata_AI <- dplyr::left_join(aggregate_predictions_brian, c19_metadata, by = "phoneticID") 
+
+c19_metadata_AI <- dplyr::left_join(c19_metadata_AI, mrale, by = "phoneticID")
+
+c19_metadata_AI[duplicated(c19_metadata_AI$phoneticID),] #evaluated if dups
+dim(c19_metadata_AI[duplicated(c19_metadata_AI$phoneticID),]) #number of dups
+
+c19_metadata_AI_distinct <- c19_metadata_AI %>% 
+  distinct(phoneticID)
+
+dim(c19_metadata_AI_distinct[duplicated(c19_metadata_AI_distinct$phoneticID),]) #number of dups
+
+
+c19_AI_firstxray <- dplyr::left_join(c19_firstxray, aggregate_predictions_brian, by = "phoneticID") 
+
+c19_AI_firstxray$phoneticID[176] #Should be Jifetef; hard code this per Brian to 1 for max prob 
+c19_AI_firstxray$lungs_max_probability_brian[176] <- 1
+
+#hard code to 1 for this per Brian
+#mortality and max lung prob
+p <- ggboxplot(c19_AI_firstxray, x = 'mortality_TF', y = 'lungs_max_probability_brian', color = 'mortality_TF', palette = 'jco', add = 'jitter') + 
+    stat_compare_means(method = 'wilcox.test') +
+    theme_bw()
+
+#mortality and mean
+p <- ggboxplot(c19_AI_firstxray, x = 'mortality_TF', y = 'lungs_mean', color = 'mortality_TF', palette = 'jco', add = 'jitter') + 
+    stat_compare_means(method = 'wilcox.test') +
+    theme_bw()
+
+#mortality and fractional area
+p <- ggboxplot(c19_AI_firstxray, x = 'mortality_TF', y = 'lungs_fractional_area_involved_brian', color = 'mortality_TF', palette = 'jco', add = 'jitter') + 
+    stat_compare_means(method = 'wilcox.test') +
+    theme_bw()
+
+#intubation and max lug prob
+p <- ggboxplot(c19_AI_firstxray, x = 'intubation_TF', y = 'lungs_max_probability_brian', color = 'intubation_TF', palette = 'jco', add = 'jitter') + 
+    stat_compare_means(method = 'wilcox.test') +
+    theme_bw()
+
+#intubation and mean
+p <- ggboxplot(c19_AI_firstxray, x = 'intubation_TF', y = 'lungs_mean', color = 'intubation_TF', palette = 'jco', add = 'jitter') + 
+    stat_compare_means(method = 'wilcox.test') +
+    theme_bw()
+
+#intubation and fractional area
+p <- ggboxplot(c19_AI_firstxray, x = 'intubation_TF', y = 'lungs_fractional_area_involved_brian', color = 'intubation_TF', palette = 'jco', add = 'jitter') + 
+    stat_compare_means(method = 'wilcox.test') +
+    theme_bw()
+
+#prolonged hospitalization and max lung prob
+p <- ggboxplot(c19_AI_firstxray, x = 'prolonged_hospitalization', y = 'lungs_max_probability_brian', color = 'prolonged_hospitalization', palette = 'jco', add = 'jitter') + 
+    stat_compare_means(method = 'wilcox.test') +
+    theme_bw()
+
+#prolonged hospitalization and mean
+p <- ggboxplot(c19_AI_firstxray, x = 'prolonged_hospitalization', y = 'lungs_mean', color = 'prolonged_hospitalization', palette = 'jco', add = 'jitter') + 
+    stat_compare_means(method = 'wilcox.test') +
+    theme_bw()
+
+#prolonged hospitalization and fractional area 
+p <- ggboxplot(c19_AI_firstxray, x = 'prolonged_hospitalization', y = 'lungs_fractional_area_involved_brian', color = 'prolonged_hospitalization', palette = 'jco', add = 'jitter') +
+    stat_compare_means(method = 'wilcox.test') +
+    theme_bw()
+```
+
+## AI Scatterplots of mRALE to AI
+```{r scatterplots of mRALE to AI}
+#mRALE to fractional area scatterplots
+
+c19_AI_firstxray$mRALE_ave <- as.numeric(c19_AI_firstxray$mRALE_ave)
+str(c19_AI_firstxray$lungs_max_probability_brian)
+
+c19_AI_firstxray_noNA <- c19_AI_firstxray %>% 
+  drop_na(mRALE_ave) %>%
+  drop_na(lungs_max_probability_brian) %>%
+  drop_na(lungs_mean) %>%
+  drop_na(lungs_max_probability_brian) %>%
+  drop_na(mRALE_ave_quartile)
+
+c19_AI_firstxray_noNA$mRALE_ave_quartile <- as.factor(c19_AI_firstxray_noNA$mRALE_ave_quartile)
+
+mrale_frac <- ggscatter(c19_AI_firstxray_noNA, x = 'mRALE_ave', y = 'lungs_fractional_area_involved_brian',
+          add = 'reg.line', # Add regression line
+          conf.int = TRUE, # Add confidence interval
+          add.params = list(color = 'black',
+                            fill = 'lightgray'),
+          color = 'mRALE_ave_quartile',
+          palette = c("red", "orange","blue","purple"),  
+          #palette = 'jco',
+          show.legend = FALSE
+          ) +
+  stat_cor(method = 'pearson', label.x = 10, label.y = 0, size = 5)
+
+mrale_frac_corr <- mrale_frac + 
+  xlab("Average mRALE Score") + 
+  ylab("Fractional Area") + 
+  scale_x_continuous(limits = c(0, 25)) + 
+  scale_y_continuous(limits = c(0, 1)) +
+  theme_classic(base_size = 18) %+replace%
+  theme(legend.position = "none")
+  
+
+
+#mRALE to max probability scatterplot
+mrale_max <- ggscatter(c19_AI_firstxray_noNA, x = 'mRALE_ave', y = 'lungs_max_probability_brian',
+          add = 'reg.line', # Add regression line
+          conf.int = TRUE, # Add confidence interval
+          add.params = list(color = 'black',
+                            fill = 'lightgray'),
+          color = "mRALE_ave_quartile", 
+          palette = c("red", "orange","blue","purple"),  
+          #palette = "jco",           # Color by groups "mRALE_bin"
+          ) +
+  stat_cor(method = 'pearson', label.x = 10, label.y = 0, size = 5)
+
+mrale_max_corr <- mrale_max + 
+  xlab("Average mRALE Score") + ylab("Maximum Probability")+ 
+  scale_x_continuous(limits = c(0, 25)) + 
+  scale_y_continuous(limits = c(0, 1)) +
+ theme_classic(base_size = 18) %+replace%
+  theme(legend.position = "none")
+
+#mRALE to mean scatterplot
+mrale_mean <- ggscatter(c19_AI_firstxray_noNA, x = 'mRALE_ave', y = 'lungs_mean',
+          add = 'reg.line', # Add regression line
+          conf.int = TRUE, # Add confidence interval
+          add.params = list(color = 'black',
+                            fill = 'lightgray'),
+          color = "mRALE_ave_quartile", 
+          #palette = "jco",    
+          palette = c("red", "orange","blue","purple"),  
+          ) +
+  stat_cor(method = 'pearson', label.x = 10, label.y = 0, size = 5)
+
+mrale_mean_corr <- mrale_mean + 
+  xlab("Average mRALE Score") + ylab("Mean Probability")+ 
+  scale_x_continuous(limits = c(0, 25)) + 
+  scale_y_continuous(limits = c(0, 1)) +
+ theme_classic(base_size = 18) %+replace%
+  theme(legend.position = "none")
+
+grid.arrange(mrale_mean_corr, mrale_frac_corr, mrale_max_corr, ncol = 1, nrow =3)
+```
+
+##AI and KM curve variable creation
+```{r AI and KM curve variable creation}
+
+###MAX PROBABILITY###
+
+c19_AI_firstxray$lungs_max_probability_brian
+
+c19_AI_firstxray <- c19_AI_firstxray %>% 
+    dplyr::mutate(maxprob_low_high = ifelse(lungs_max_probability_brian < 0.75, 1, ifelse(lungs_max_probability_brian >= 0.75, 2, NA))) 
+
+table(c19_AI_firstxray$maxprob_low_high)
+
+###MEAN PROBABILITY###
+
+c19_AI_firstxray$lungs_mean
+
+c19_AI_firstxray <- c19_AI_firstxray %>% 
+    dplyr::mutate(mean_low_high = ifelse(lungs_mean < 0.2, 1, ifelse(lungs_mean >= 0.2, 2, NA))) 
+
+table(c19_AI_firstxray$mean_low_high)
+
+###FRACTIONAL AREA###
+
+c19_AI_firstxray$lungs_fractional_area_involved_brian
+
+c19_AI_firstxray <- c19_AI_firstxray %>% 
+    dplyr::mutate(fracarea_low_high = ifelse(lungs_fractional_area_involved_brian < 0.5, 1, ifelse(lungs_fractional_area_involved_brian >= 0.5, 2, NA))) 
+
+table(c19_AI_firstxray$fracarea_low_high)
+
+```
+
+## AI first x-ray to hospitalization KM curves 
+```{r}
+#c19_AI_firstxray$maxprob_low_high
+
+fit <- survfit(Surv(xray_relative_discharge, discharge_TF) ~ maxprob_quartile_manual, data = c19_AI_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+ggsurvplot(fit, data = c19_AI_firstxray,
+           title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+          surv.median.line = "hv",# Add median survival lines
+          #cumcensor = TRUE,  #ogical value specifying whether to show or not the table of the cumulative number of censoring. Default is FALSE.
+          #legend.title = "mRALE Bin",               # Change legend titles
+           legend.labs = c("1: Max. Probability < 0.75", "2: Max. Probability >= 0.75"),  # Change legend labels
+           #legend.labs = c("Mortality = F", "Mortality = T"),
+           xlab = "Days from first x-ray", font.main = c(16, "plain", "black"),
+           ylab = "Length of stay probability",
+           palette = "jco",                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = TRUE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+)
+
+#c19_AI_firstxray$mean_low_high
+
+fit <- survfit(Surv(xray_relative_discharge, discharge_TF) ~ mean_low_high, data = c19_AI_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+ggsurvplot(fit, data = c19_AI_firstxray,
+           title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+          surv.median.line = "hv",            # Add median survival lines
+           #legend.title = "mRALE Bin",               # Change legend titles
+          legend.labs = c("1: Mean Probability < 0.2", "2: Mean Probability >= 0.2"),  # Change legend labels
+           #legend.labs = c("Mortality = F", "Mortality = T"),
+           xlab = "Days from first x-ray", font.main = c(16, "plain", "black"),
+           ylab = "Length of stay probability",
+           palette = "jco",                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = TRUE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+)
+
+#c19_AI_firstxray$fracarea_low_high
+
+fit <- survfit(Surv(xray_relative_discharge, discharge_TF) ~ fracarea_low_high, data = c19_AI_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+ggsurvplot(fit, data = c19_AI_firstxray,
+           title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+          surv.median.line = "hv",            # Add median survival lines
+           #legend.title = "mRALE Bin",               # Change legend titles
+          legend.labs = c("1: Fractional Area < 0.5", "2: Fractional Area >= 0.5"),  # Change legend labels
+           #legend.labs = c("Mortality = F", "Mortality = T"),
+           xlab = "Days from first x-ray", font.main = c(16, "plain", "black"),
+           ylab = "Length of stay probability",
+           palette = "jco",                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = TRUE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+)
+
+```
+
+## AI first x-ray to intubation KM curves 
+```{r}
+
+#c19_AI_firstxray$maxprob_low_high
+
+fit <- survfit(Surv(censor_intubation, intubation_TF) ~ maxprob_low_high, data = c19_AI_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+ggsurvplot(fit, data = c19_AI_firstxray,
+           title = "Freedom from Intubation for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+          surv.median.line = "hv",# Add median survival lines
+          #cumcensor = TRUE,  #ogical value specifying whether to show or not the table of the cumulative number of censoring. Default is FALSE.
+          #legend.title = "mRALE Bin",               # Change legend titles
+           legend.labs = c("1: Max. Probability < 0.75", "2: Max. Probability >= 0.75"),  # Change legend labels
+           #legend.labs = c("Mortality = F", "Mortality = T"),
+           xlab = "Days from first x-ray", font.main = c(16, "plain", "black"),
+           ylab = "Freedom from Intubation",
+           palette = "jco",                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = TRUE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+)
+
+#c19_AI_firstxray$mean_low_high
+
+fit <- survfit(Surv(censor_intubation, intubation_TF) ~ mean_low_high, data = c19_AI_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+ggsurvplot(fit, data = c19_AI_firstxray,
+           title = "Freedom from Intubation for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+          surv.median.line = "hv",            # Add median survival lines
+           #legend.title = "mRALE Bin",               # Change legend titles
+          legend.labs = c("1: Mean Probability < 0.2", "2: Mean Probability >= 0.2"),  # Change legend labels
+           #legend.labs = c("Mortality = F", "Mortality = T"),
+           xlab = "Days from first x-ray", font.main = c(16, "plain", "black"),
+           ylab = "Freedom from Intubation",
+           palette = "jco",                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = TRUE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+)
+
+#c19_AI_firstxray$fracarea_low_high
+
+fit <- survfit(Surv(censor_intubation, intubation_TF) ~ fracarea_low_high, data = c19_AI_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+ggsurvplot(fit, data = c19_AI_firstxray,
+           title = "Freedom from Intubation for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+          surv.median.line = "hv",            # Add median survival lines
+           #legend.title = "mRALE Bin",               # Change legend titles
+          legend.labs = c("1: Fractional Area < 0.5", "2: Fractional Area >= 0.5"),  # Change legend labels
+           #legend.labs = c("Mortality = F", "Mortality = T"),
+           xlab = "Days from first x-ray", font.main = c(16, "plain", "black"),
+           ylab = "Freedom from Intubation",
+           palette = "jco",                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = TRUE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+)
+
+#albert_table_2 <- c19_firstxray %>% dplyr::select(mrn, xray_relative_mortality, xray_relative_discharge, censor_hosp_duration)
+
+```
+
+## AI first x-ray to mortality KM curves 
+```{r}
+#c19_AI_firstxray$maxprob_low_high
+
+fit <- survfit(Surv(censor_mortality, mortality_TF) ~ maxprob_low_high, data = c19_AI_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+ggsurvplot(fit, data = c19_AI_firstxray,
+           title = "Survival Probability for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+          surv.median.line = "hv",            # Add median survival lines
+           #legend.title = "mRALE Bin",               # Change legend titles
+           legend.labs = c("1: Max. Probability < 0.75", "2: Max. Probability >= 0.75"),  # Change legend labels
+           #legend.labs = c("Mortality = F", "Mortality = T"),
+           xlab = "Days from first x-ray", font.main = c(16, "plain", "black"),
+           ylab = "Survival Probability",
+           palette = "jco",                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           #ncensor.plot = TRUE,      # plot the number of censored subjects at time t
+           cumevents = TRUE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+)
+
+#c19_AI_firstxray$mean_low_high
+
+fit <- survfit(Surv(censor_mortality, mortality_TF) ~ mean_low_high, data = c19_AI_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+ggsurvplot(fit, data = c19_AI_firstxray,
+           title = "Survival Probability for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+          surv.median.line = "hv",            # Add median survival lines
+           #legend.title = "mRALE Bin",               # Change legend titles
+          legend.labs = c("1: Mean Probability < 0.2", "2: Mean Probability >= 0.2"),  # Change legend labels
+           #legend.labs = c("Mortality = F", "Mortality = T"),
+           xlab = "Days from first x-ray", font.main = c(16, "plain", "black"),
+           ylab = "Survival Probability",
+           palette = "jco",                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           #ncensor.plot = TRUE,      # plot the number of censored subjects at time t
+           cumevents = TRUE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+)
+
+
+#c19_AI_firstxray$fracarea_low_high
+
+fit <- survfit(Surv(censor_mortality, mortality_TF) ~ fracarea_low_high, data = c19_AI_firstxray)
+
+          ggsurvplot(fit, data = c19_AI_firstxray,
+           title = "Survival Probability for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+          surv.median.line = "hv",            # Add median survival lines
+           #legend.title = "mRALE Bin",               # Change legend titles
+          legend.labs = c("1: Fractional area < 0.5", "2: Fractional area >= 0.5"),  # Change legend labels
+           #legend.labs = c("Mortality = F", "Mortality = T"),
+           xlab = "Days from first x-ray", font.main = c(16, "plain", "black"),
+           ylab = "Survival Probability",
+           palette = "jco",                    # Use JCO journal color palette
+           risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           #ncensor.plot = TRUE,      # plot the number of censored subjects at time t
+           cumevents = TRUE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+)          
+#albert_table_2 <- c19_firstxray %>% dplyr::select(mrn, xray_relative_mortality, xray_relative_discharge, censor_hosp_duration)
+
+table(c19_AI_firstxray$mortality_TF)
+```
+
+## Quartiles AI Frac Area Only KM curves (first xray)
+```{r}
+#c19_AI_firstxray$fracarea_quartile <- ntile(c19_AI_firstxray$lungs_fractional_area_involved_brian, 4)  #Splits data into 4ths, not based on a set interval
+
+c19_AI_firstxray <- c19_AI_firstxray %>% 
+  dplyr::mutate(fracarea_quartile = ifelse(lungs_fractional_area_involved_brian >= 0 & lungs_fractional_area_involved_brian <= 0.24020964, 1, ifelse(lungs_fractional_area_involved_brian >= 0.24020965 & lungs_fractional_area_involved_brian <= 0.48041928, 2, ifelse(lungs_fractional_area_involved_brian >= 0.48041929 & lungs_fractional_area_involved_brian <= 0.72062892, 3, 4)))) #quartiles based on 0, .25, .5, .75
+
+#c19_AI_firstxray$fracarea_quartile
+
+#Intubation
+
+fit <- survfit(Surv(censor_intubation, intubation_TF) ~ fracarea_quartile, data = c19_AI_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+g8 <- ggsurvplot(fit,  
+           size = 2.5,
+           censor = FALSE,
+           base_size = 18,
+           #title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.coord = c(6, 0.16), 
+           #pval.method = TRUE,    # Add p-value &  method name
+           ylab = "Likelihood", font.main = c(18, "plain", "black"),
+           xlab = "Time (Days)",
+           break.time.by = 7,
+           font.x = c(18, "plain", "black"),
+           font.y = c(18, "plain", "black"),
+           font.tickslab = c(15, "plain", "black"),
+           surv.median.line = "hv",            # Add median survival lines
+           #legend = c("right"),
+           font.legend = c(18, "plain","black"),
+           #legend.title = c("Mean Probability"),
+           #legend.labs = c("0.001 - 0.105", "0.106 - 0.209", "0.210 - 0.314 ", "0.315 - 0.418"),  # Change legend labels
+           show.legend = FALSE, 
+           palette = c("red", "orange","blue","purple"),                    # Use JCO journal color palette
+           #risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+           #linetype = c('dotted', 'dotdash','solid','dashed')
+)
+
+
+res <- pairwise_survdiff(Surv(censor_intubation, intubation_TF) ~ fracarea_quartile, data = c19_AI_firstxray, p.adjust.method = "BH")
+res
+
+#Mortality 
+
+fit <- survfit(Surv(censor_mortality, mortality_TF) ~ fracarea_quartile, data = c19_AI_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+g7 <- ggsurvplot(fit,  
+           size = 2.5,
+           censor = FALSE,
+           base_size = 18,
+           #title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.coord = c(30, 0.50), 
+           #pval.method = TRUE,    # Add p-value &  method name
+           ylab = "Likelihood", font.main = c(18, "plain", "black"),
+           xlab = "Time (Days)",
+           font.x = c(18, "plain", "black"),
+           font.y = c(18, "plain", "black"),
+           font.tickslab = c(15, "plain", "black"),
+           surv.median.line = "hv",            # Add median survival lines
+           #legend = c("right"),
+           font.legend = c(18, "plain","black"),
+           #legend.title = c("Mean Probability"),
+           #legend.labs = c("0.001 - 0.105", "0.106 - 0.209", "0.210 - 0.314 ", "0.315 - 0.418"),  # Change legend labels
+           show.legend = FALSE, 
+           palette = c("red", "orange","blue","purple"),                    # Use JCO journal color palette
+           #risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+           #linetype = c('dotted', 'dotdash','solid','dashed')
+)
+
+
+res <- pairwise_survdiff(Surv(censor_mortality, mortality_TF) ~ fracarea_quartile, data = c19_AI_firstxray)
+res
+
+#Discharge
+
+fit <- survfit(Surv(xray_relative_discharge, discharge_TF) ~ fracarea_quartile, data = c19_AI_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+g9 <- ggsurvplot(fit,  
+           size = 2.5,
+           censor = FALSE,
+           base_size = 18,
+           #title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.coord = c(30, 0.50), 
+           #pval.method = TRUE,    # Add p-value &  method name
+           ylab = "Likelihood", font.main = c(18, "plain", "black"),
+           xlab = "Time (Days)",
+           #break.time.by = 1,
+           font.x = c(18, "plain", "black"),
+           font.y = c(18, "plain", "black"),
+           font.tickslab = c(15, "plain", "black"),
+           surv.median.line = "hv",            # Add median survival lines
+           #legend = c("right"),
+           font.legend = c(18, "plain","black"),
+           #legend.title = c("Mean Probability"),
+           #legend.labs = c("0.001 - 0.105", "0.106 - 0.209", "0.210 - 0.314 ", "0.315 - 0.418"),  # Change legend labels
+           show.legend = FALSE, 
+           palette = c("red", "orange","blue","purple"),                    # Use JCO journal color palette
+           #risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+           #linetype = c('dotted', 'dotdash','solid','dashed')
+)
+
+
+res <- pairwise_survdiff(Surv(xray_relative_discharge, discharge_TF) ~ fracarea_quartile, data = c19_AI_firstxray)
+res
+```
+## Quartiles AI Max Prob Only KM curves (first xray)
+```{r}
+#c19_AI_firstxray$maxprob_quartile <- ntile(c19_AI_firstxray$lungs_max_probability_brian, 4)  #Splits data into 4ths, not based on a set interval
+
+#c19_AI_firstxray$maxprob_quartile <- as.numeric(c19_AI_firstxray$maxprob_quartile)
+
+c19_AI_firstxray <- c19_AI_firstxray %>% 
+  dplyr::mutate(maxprob_quartile_manual = ifelse(lungs_max_probability_brian >= 0.017196633 & lungs_max_probability_brian <= 0.26289747, 1, ifelse(lungs_max_probability_brian >= 0.26289748 & lungs_max_probability_brian <= 0.50859831, 2, ifelse(lungs_max_probability_brian >= 0.50859832 & lungs_max_probability_brian <= 0.75429915, 3, 4)))) #manual calculation of quartiles between max prob range 0.017196633 and 1.209512472
+
+#c19_AI_firstxray$quartile_diff <- c19_AI_firstxray$maxprob_quartile - c19_AI_firstxray$maxprob_quartile_manual #check for differences between quartiles calculated
+
+
+#Intubation
+
+fit <- survfit(Surv(censor_intubation, intubation_TF) ~ maxprob_quartile_manual, data = c19_AI_firstxray)
+
+g11 <- ggsurvplot(fit,  
+           size = 2.5,
+           censor = FALSE,
+           base_size = 18,
+           #title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.coord = c(6, 0.16), 
+           #pval.method = TRUE,    # Add p-value &  method name
+           ylab = "Likelihood", font.main = c(18, "plain", "black"),
+           xlab = "Time (Days)",
+           break.time.by = 7,
+           font.x = c(18, "plain", "black"),
+           font.y = c(18, "plain", "black"),
+           font.tickslab = c(15, "plain", "black"),
+           surv.median.line = "hv",            # Add median survival lines
+           #legend = c("right"),
+           font.legend = c(18, "plain","black"),
+           #legend.title = c("Mean Probability"),
+           #legend.labs = c("0.001 - 0.105", "0.106 - 0.209", "0.210 - 0.314 ", "0.315 - 0.418"),  # Change legend labels
+           show.legend = FALSE, 
+           palette = c("red", "orange","blue","purple"),                    # Use JCO journal color palette
+           #risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+           #linetype = c('dotted', 'dotdash','solid','dashed')
+)
+
+res <- pairwise_survdiff(Surv(censor_intubation, intubation_TF) ~ maxprob_quartile_manual, data = c19_AI_firstxray)
+res
+
+#Mortality 
+
+fit <- survfit(Surv(censor_mortality, mortality_TF) ~ maxprob_quartile_manual, data = c19_AI_firstxray)
+
+g10 <- ggsurvplot(fit,  
+           size = 2.5,
+           censor = FALSE,
+           base_size = 18,
+           #title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.coord = c(30, 0.50), 
+           #pval.method = TRUE,    # Add p-value &  method name
+           ylab = "Likelihood", font.main = c(18, "plain", "black"),
+           xlab = "Time (Days)",
+          #break.time.by = 30,
+           font.x = c(18, "plain", "black"),
+           font.y = c(18, "plain", "black"),
+           font.tickslab = c(15, "plain", "black"),
+           surv.median.line = "hv",            # Add median survival lines
+           #legend = c("right"),
+           font.legend = c(18, "plain","black"),
+           #legend.title = c("Mean Probability"),
+           #legend.labs = c("0.001 - 0.105", "0.106 - 0.209", "0.210 - 0.314 ", "0.315 - 0.418"),  # Change legend labels
+           show.legend = FALSE, 
+           palette = c("red", "orange","blue","purple"),                    # Use JCO journal color palette
+           #risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+           #linetype = c('dotted', 'dotdash','solid','dashed')
+)
+
+
+res <- pairwise_survdiff(Surv(censor_mortality, mortality_TF) ~ maxprob_quartile_manual, data = c19_AI_firstxray)
+res
+
+#Discharge
+
+fit <- survfit(Surv(xray_relative_discharge, discharge_TF) ~ maxprob_quartile_manual, data = c19_AI_firstxray)
+
+g12 <- ggsurvplot(fit,  
+           size = 2.5,
+           censor = FALSE,
+           base_size = 18,
+           #title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.coord = c(30, 0.50), 
+           #pval.method = TRUE,    # Add p-value &  method name
+           ylab = "Likelihood", font.main = c(18, "plain", "black"),
+           xlab = "Time (Days)",
+           #break.time.by = 13,
+           font.x = c(18, "plain", "black"),
+           font.y = c(18, "plain", "black"),
+           font.tickslab = c(15, "plain", "black"),
+           surv.median.line = "hv",            # Add median survival lines
+           #legend = c("right"),
+           font.legend = c(18, "plain","black"),
+           #legend.title = c("Mean Probability"),
+           #legend.labs = c("0.001 - 0.105", "0.106 - 0.209", "0.210 - 0.314 ", "0.315 - 0.418"),  # Change legend labels
+           show.legend = FALSE, 
+           palette = c("red", "orange","blue","purple"),                    # Use JCO journal color palette
+           #risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+           #linetype = c('dotted', 'dotdash','solid','dashed')
+)
+
+res <- pairwise_survdiff(Surv(xray_relative_discharge, discharge_TF) ~ maxprob_quartile_manual, data = c19_AI_firstxray)
+res
+```
+
+## Quartiles AI Mean Prob Only KM curves (first xray)
+```{r}
+#c19_AI_firstxray$meanprob_quartile <- ntile(c19_AI_firstxray$lungs_mean, 4)  #Splits data into 4ths, not based on a set interval
+
+c19_AI_firstxray$lungs_mean <- as.numeric(c19_AI_firstxray$lungs_mean)
+
+c19_AI_firstxray <- c19_AI_firstxray %>% 
+  dplyr::mutate(meanprob_quartile_manual = ifelse(lungs_mean >= 0.0043219970 & lungs_mean <= 0.23127044, 1, ifelse(lungs_mean >= 0.23127041 & lungs_mean <= 0.45821888
+, 2, ifelse(lungs_mean >= 0.45821889
+ & lungs_mean <= 0.68516732, 3, 4)))) #manual calculation of quartiles between max prob range 0.017196633 and 1.209512472
+
+#c19_AI_firstxray <- c19_AI_firstxray %>% 
+#  dplyr::mutate(meanprob_quartile_manual_0_1 = ifelse(lungs_mean >= 0.001 & lungs_mean <= 0.10581564, 0, ifelse(lungs_mean > 0.31418285, 1, NA))) #0 = 1st quartile, 4 is 4th quartile, all else is NA
+
+#c19_AI_firstxray$quartile_diff <- c19_AI_firstxray$meanprob_quartile_manual - c19_AI_firstxray$meanprob_quartile_manual #check for differences between quartiles calculated
+
+#Mortality 
+
+fit <- survfit(Surv(censor_mortality, mortality_TF) ~ meanprob_quartile_manual, data = c19_AI_firstxray)
+
+g4 <- ggsurvplot(fit,  
+           size = 2.5,
+           censor = FALSE,
+           base_size = 18,
+           #title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.coord = c(30, 0.50), 
+           #pval.method = TRUE,    # Add p-value &  method name
+           ylab = "Likelihood", font.main = c(18, "plain", "black"),
+           xlab = "Time (Days)",
+           #break.time.by = 30,
+           font.x = c(18, "plain", "black"),
+           font.y = c(18, "plain", "black"),
+           font.tickslab = c(15, "plain", "black"),
+           surv.median.line = "hv",            # Add median survival lines
+           #legend = c("right"),
+           font.legend = c(18, "plain","black"),
+           #legend.title = c("Mean Probability"),
+           #legend.labs = c("0.001 - 0.105", "0.106 - 0.209", "0.210 - 0.314 ", "0.315 - 0.418"),  # Change legend labels
+           show.legend = FALSE, 
+           palette = c("red", "orange","blue","purple"),                    # Use JCO journal color palette
+           #risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE
+           #linetype = c('dotted', 'dotdash','solid','dashed')
+)
+
+
+res <- pairwise_survdiff(Surv(censor_mortality, mortality_TF) ~ meanprob_quartile_manual, data = c19_AI_firstxray, p.adjust.method = "BH")
+res
+
+res.cox <- coxph(Surv(censor_mortality, mortality_TF) ~ meanprob_quartile_manual_0_1, data = c19_AI_firstxray)
+summary(res.cox)                   
+#summary(res.cox) #output will list manual1, manual2, etc. "0th" level, our lowest quantile, is ref, man1 = "2", man2 = "3," man3 = "4"
+
+#fit <- survfit(Surv(censor_mortality, mortality_TF) ~ meanprob_quartile_manual, data = c19_AI_firstxray)
+#surv_object <- fit$surv
+#test <- coxph(surv_object ~ meanprob_quartile_manual, data = c19_AI_firstxray)
+
+ggforest(res.cox, data = c19_AI_firstxray)
+
+#Intubation
+
+fit <- survfit(Surv(censor_intubation, intubation_TF) ~ meanprob_quartile_manual, data = c19_AI_firstxray)
+
+#Relabel axes: X should be time to discharge
+
+g5 <- ggsurvplot(fit,  
+           size = 2.8,
+           base_size = 18,
+           censor = FALSE, 
+           #title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.coord = c(6, 0.16), 
+           #pval.method = TRUE,    # Add p-value &  method name
+           ylab = "Likelihood", font.main = c(18, "plain", "black"),
+           xlab = "Time (Days)",
+           break.time.by = 7,
+           font.x = c(18, "plain", "black"),
+           font.y = c(18, "plain", "black"),
+           font.tickslab = c(15, "plain", "black"),
+           surv.median.line = "hv",            # Add median survival lines
+           #legend = c("right"),
+           #font.legend = c(18, "plain","black"),
+          #legend.labs = c("1: Mean Prob. 0.001 - 0.105", "2: Mean Prob. 0.106 - 0.209", "3: Mean Prob. 0.210 - 0.314 ", "4: Mean Prob. 0.315 - 0.418"),  # Change legend labels
+           show.legend = FALSE,
+           palette = c("red", "orange","blue","purple"),                    # Use JCO journal color palette
+           #risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE,
+           #linetype = c('dotted', 'dotdash','solid','dashed')
+)
+
+#Post-hoc pairwise comparisons using the log-rank test
+res <- pairwise_survdiff(Surv(censor_intubation, intubation_TF) ~ meanprob_quartile_manual, data = c19_AI_firstxray)
+res
+
+print(res, 20)
+
+#Cox regression model fit
+
+c19_AI_firstxray$meanprob_quartile_manual_0_1 <- as.numeric(c19_AI_firstxray$meanprob_quartile_manual_0_1) #strata muse be a factor for ggforest/cox
+
+res.cox <- coxph(Surv(censor_intubation, intubation_TF) ~ meanprob_quartile_manual_0_1, data = c19_AI_firstxray)
+summary(res.cox) #output will list manual1, manual2, etc. "0th" level, our lowest quantile, is ref, man1 = "2", man2 = "3," man3 = "4"
+
+ggforest(res.cox, data = c19_AI_firstxray)
+
+#Discharge
+
+fit <- survfit(Surv(xray_relative_discharge, discharge_TF) ~ meanprob_quartile_manual, data = c19_AI_firstxray)
+
+g6 <- ggsurvplot(fit,  
+           size = 2.8,
+           base_size = 18,
+           censor = FALSE, 
+           #title = "Length of stay for 205 patients with 1st x-ray in 1-3 days of hospital visit",
+           pval = TRUE, pval.coord = c(30, 0.50), 
+           #pval.method = TRUE,    # Add p-value &  method name
+           ylab = "Likelihood", font.main = c(18, "plain", "black"),
+           xlab = "Time (Days)",
+           #break.time.by = 17,
+           font.x = c(18, "plain", "black"),
+           font.y = c(18, "plain", "black"),
+           font.tickslab = c(15, "plain", "black"),
+           surv.median.line = "hv",            # Add median survival lines
+           #legend = c("right"),
+           #font.legend = c(18, "plain","black"),
+          #legend.labs = c("1: Mean Prob. 0.001 - 0.105", "2: Mean Prob. 0.106 - 0.209", "3: Mean Prob. 0.210 - 0.314 ", "4: Mean Prob. 0.315 - 0.418"),  # Change legend labels
+           show.legend = FALSE,
+           palette = c("red", "orange","blue","purple"),                    # Use JCO journal color palette
+           #risk.table = "abs_pct",                  # Add No at risk table with percentage at risk
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.15,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE,
+           #linetype = c('dotted', 'dotdash','solid','dashed')
+)
+
+grid.arrange(g1$plot, g2$plot, g3$plot, g4$plot, g5$plot, g6$plot, g7$plot, g8$plot, g9$plot, g10$plot, g11$plot, g12$plot,  ncol = 3, nrow =4)
+
+res <- pairwise_survdiff(Surv(xray_relative_discharge, discharge_TF) ~ meanprob_quartile_manual, data = c19_AI_firstxray, p.adjust.method = "BH")
+res 
+
+res.cox <- coxph(Surv(xray_relative_discharge, discharge_TF) ~ meanprob_quartile_manual_0_1, data = c19_AI_firstxray)
+summary(res.cox)
+             
+
+```
+
+## AUC and Youden 
+```{r cutpointr AUC and Youden Index - define thresholds for covid19 data}
+
+# #http://www.imsbio.co.jp/RGM/R_rdfile?f=OptimalCutpoints/man/plot.optimal.cutpoints.Rd&d=R_CC
+# 
+# library(OptimalCutpoints)
+# #data(elas)
+# 
+# #Formula method
+# #optimal.cutpoint.Youden <- optimal.cutpoints(X = "elas", status = "status", tag.healthy = 0, 
+# #methods = "Youden", data = elas, pop.prev = NULL, categorical.cov = "gender", 
+# #control = control.cutpoints(), ci.fit = FALSE, conf.level = 0.95, trace = FALSE)
+# 
+# #Inference on the test accuracy measures
+# #optimal.cutpoint.Youden <- optimal.cutpoints(X = "elas", status = "status", tag.healthy = 0, 
+# #methods = "Youden", data = elas, pop.prev = NULL, categorical.cov = "gender", 
+# #control = control.cutpoints(), ci.fit = TRUE, conf.level = 0.95, trace = FALSE)
+# 
+# #summary(optimal.cutpoint.Youden)
+# 
+# #plot(optimal.cutpoint.Youden)
+# 
+# cutpoint_df <- c19_AI_firstxray_noNA %>% dplyr::select(
+#   lungs_mean, #make into double
+#   lungs_max_probability_brian, #double
+#   mRALE_bin, #factor
+#   mortality_TF, #logical
+#   intubation_TF, #logical
+#   prolonged_hospitalization, #logical 
+#   phoneticID, #character
+#   lungs_fractional_area_involved_brian, #double
+#   mrn #character
+# )
+# 
+# #write.csv(cutpoint_df, file = "cutpoint_df")
+# 
+# cutpoint_df$mRALE_bin <- as.factor(cutpoint_df$mRALE_bin)
+# cutpoint_df <- ungroup(cutpoint_df)
+# cutpoint_df <- droplevels(cutpoint_df)
+# 
+# lungs_frac_2 <- as.data.frame(unlist(cutpoint_df$lungs_fractional_area_involved_brian))
+# lungs_frac_2$mortality_TF <- unlist(cutpoint_df$mortality_TF)
+# lungs_frac_2$mRALE_bin <- unlist(cutpoint_df$mRALE_bin)
+# 
+# lungs_frac_2 <- lungs_frac_2 %>%
+#   rename(
+#     lfai = `unlist(cutpoint_df$lungs_fractional_area_involved_brian)`
+#     ) 
+# 
+# dplyr::rename(lungs_frac_2, fai = `unlist(cutpoint_df$lungs_fractional_area_involved_brian)`)
+# 
+# lungs_frac_2 <- as.data.frame(lungs_frac_2)
+# 
+# optimal.cutpoint.Youden <- optimal.cutpoints(X = "lfai", status = "mortality_TF", tag.healthy = 0, methods = "Youden", data = lungs_frac_2, direction = c(), pop.prev = NULL, categorical.cov = NULL, control = control.cutpoints(), ci.fit = TRUE, conf.level = 0.95, trace = FALSE)
+# 
+# summary(optimal.cutpoint.Youden)
+# 
+# plot(optimal.cutpoint.Youden)
+# 
+
+```
+```{r risk ratios}
+#The relative risk (also known as risk ratio [RR]) is the ratio of risk of an event in one group (e.g., exposed group) versus the risk of the event in the other group (e.g., nonexposed group). The odds ratio (OR) is the ratio of odds of an event in one group versus the odds of the event in the other group.
+
+
+
+```
+
+##Odds Ratios
+```{r odds ratios, include = FALSE}
+# # https://www.rdocumentation.org/packages/questionr/versions/0.7.1/topics/odds.ratio
+# 
+# odds.ratio(x, ...)
+# # S3 method for glm
+# odds.ratio(x, level = 0.95, ...)
+# 
+# # S3 method for multinom
+# odds.ratio(x, level = 0.95, ...)
+# 
+# # S3 method for factor
+# odds.ratio(x, fac, level = 0.95, ...)
+# 
+# # S3 method for table
+# odds.ratio(x, level = 0.95, ...)
+# 
+# # S3 method for matrix
+# odds.ratio(x, level = 0.95, ...)
+# 
+# # S3 method for numeric
+# odds.ratio(x, y, level = 0.95, ...)
+# 
+# # S3 method for odds.ratio
+# print(x, signif.stars = TRUE, ...)
+# #Code for plotting odds ratios, where the odds ratios have been previously calculated (boxOdds), along with the confidence intervals (Low and high)
+# 
+# library(ggplot2)
+# 
+# # Create labels
+# boxLabels = c("Past encounter", "Mutualism WVO:\nNon-hunting wildlife experiences", "Domination WVO:\nEthics of hunting", "Domination WVO:\nWildlife management", "Age", "Education", "Negative attitudes toward box turtles", "Gender")
+# 
+# # Enter summary data. boxOdds are the odds ratios (calculated elsewhere), boxCILow is the lower bound of the CI, boxCIHigh is the upper bound.
+# 
+# df <- data.frame(
+#   yAxis = length(boxLabels):1,
+#   boxOdds = c(2.23189,1.315737,1.22866,.8197413,.9802449,.9786673,.6559005,.5929812),
+#   boxCILow = c(.7543566,1.016,.9674772,.6463458,.9643047,.864922,.4965308,.3572142),
+#   boxCIHigh = c(6.603418,1.703902,1.560353,1.039654,.9964486,1.107371,.8664225,.9843584)
+# )
+# 
+# # Plot
+# p <- ggplot(df, (aes(x = df$boxOdds, y = df$yAxis)))
+# 
+# p + geom_vline(aes(xintercept = 1), size = .25, linetype = "dashed") +
+#   geom_errorbarh(aes(xmax = boxCIHigh, xmin = boxCILow), size = .5, height = .2, color = "gray50") +
+#   geom_point(size = 3.5, color = "orange") +
+#   theme_bw() +
+#   theme(panel.grid.minor = element_blank()) +
+#   scale_y_continuous(breaks = df$yAxis, labels = df$boxLabels) +
+#   scale_x_continuous(breaks = seq(0,7,1) ) +
+#   coord_trans(x = "log10") +
+#   ylab("") +
+#   xlab("Odds ratio (log scale)") +
+#   annotate(geom = "text", y =1.1, x = 3.5, label ="Model p < 0.001\nPseudo R^2 = 0.10", size = 3.5, hjust = 0) + ggtitle("Intention to remove box turtles from the road")
+
+```
+
+## Cox proportional Hazard Models
+```{r Cox Proportional Hazard Models, include = FALSE}
+# #CPHM allow covariate inclusion. Models builts using Coxph function, visualized in ggforest. Shows hazard ratios (HR) derived from the model for all covariates included in the furmula in coxph. HR > 1 = increased risk of death, HR < 1 decreased risk
+# 
+# #Hazard ratios differ from relative risks (RRs) and odds ratios (ORs) in that RRs and ORs are cumulative over an entire study, using a defined endpoint, while HRs represent instantaneous risk over the study time period, or some subset thereof.
+# 
+# c19_metadata$hospital_duration <- as.numeric(c19_metadata$hospital_duration)
+# c19_metadata$intubation_TF <- as.factor(c19_metadata$intubation_TF)
+# c19_metadata$mRALE_score <- as.factor(c19_metadata$mRALE_score)
+# c19_metadata$mRALE_bin <- as.factor(c19_metadata$mRALE_bin)
+# c19_metadata$prolonged_hospitalization <- as.factor(c19_metadata$prolonged_hospitalization)
+# 
+# #Survival Plot by mRALE bin 
+# fit <- survfit(Surv(hospital_duration, mortality_TF) ~ mRALE_bin, data = c19_metadata)
+# 
+# ggsurvplot(fit, data = c19_metadata,
+#            title = "Survival Curves",
+#            pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+#            surv.median.line = "hv",            # Add median survival lines
+#            legend.title = "mRALE low/high",               # Change legend titles
+#            legend.labs = c("1: mRALE == 0", "2: mRALE == 24"),  # Change legend labels
+#            palette = "jco",                    # Use JCO journal color palette
+#            risk.table = TRUE,                  # Add No at risk table
+#            cumevents = TRUE,                   # Add cumulative No of events table
+#            tables.height = 0.15,               # Specify tables height
+#            tables.theme = theme_cleantable(),  # Clean theme for tables
+#            tables.y.text = FALSE
+# )
+# 
+# 
+# 
+# surv_object <- Surv(c19_metadata$hospital_duration, event = c19_metadata$mortality_TF)
+# surv_object
+# 
+# 
+# fit.coxph <- coxph(surv_object ~ mRALE_bin + intubation_TF + , 
+#                    data = c19_metadata)
+# 
+# ggforest(fit.coxph, data = c19_metadata)
+# 
+# #Survival Plot by mRALE bin for xrays within FIRST THREE DAYS of hospital admission
+# fit <- survfit(Surv(hospital_duration, prolonged_hospitalization) ~ mRALE_bin, data = c19_firstxray)
+# 
+# ggsurvplot(fit, data = c19_firstxray,
+#            conf.int = TRUE,
+#            title = "Prolonged Hospitalization Probability (%)",
+#            pval = TRUE, pval.method = TRUE,    # Add p-value &  method name
+#            fun = "pct", # Add percentage function
+#            linetype = "strata",
+#            legend = "bottom",
+#            legend.title = "mRALE Bin",               # Change legend titles
+#            legend.labs = c("1: 0 < mRALE <= 4", "2: 5 <= mRALE <= 10", "3: mRALE > 10"),  # Change legend labels
+#            palette = "jco",                    # Use JCO journal color palette
+#            risk.table = TRUE,                  # Add No at risk table
+#            tables.height = 0.15,               # Specify tables height
+#            tables.theme = theme_cleantable(),  # Clean theme for tables
+#            tables.y.text = FALSE
+# )
+# 
+# 
+# 
+# surv_object <- Surv(c19_metadata$hospital_duration, event = c19_metadata$mortality_TF)
+# surv_object
+# 
+# 
+# fit.coxph <- coxph(surv_object ~ mRALE_bin + intubation_TF + , 
+#                    data = c19_metadata)
+# # 
+# ggforest(fit.coxph, data = c19_metadata)
+```
+
+##Cohen's Kappa and Misc.
+```{r, include = FALSE}
+
+https://www.r-bloggers.com/2018/04/k-is-for-cohens-kappa/
+
+library(rel)  
+
+#load in misha, albert, kate scores and filter for ones that have been scored by >=2 raters
+cohensk_albert <- read_csv("cohensk_albert.csv")
+cohensk_kate <- read_csv("cohensk_kate.csv")
+cohensk_albert <- read_csv("cohensk_albert.csv")
+cohensk_lewis <- read_csv("cohensk_lewis.csv")
+cohensk_seth <- read_csv("cohensk_seth.csv")
+
+cohensk_1 <- inner_join(cohensk_albert, cohensk_kate, by = "phonetic_id")
+
+cohensk_1 <- cohensk_1[,-1]
+
+cohensk_2 <- inner_join(cohensk_albert, cohensk_misha, by = "phonetic_id")
+
+cohensk_2 <- cohensk_2[,-1]
+
+cohensk_3 <- inner_join(cohensk_misha, cohensk_kate, by = "phonetic_id")
+
+cohensk_3 <- cohensk_3[,-1]
+
+cohensk_4 <- inner_join(cohensk_lewis, cohensk_albert, by = "phonetic_id")
+
+cohensk_4 <- cohensk_4[,-1]
+
+cohensk_5 <- inner_join(cohensk_lewis, cohensk_misha, by = "phonetic_id")
+
+cohensk_5 <- cohensk_5[,-1]
+
+cohensk_6 <- inner_join(cohensk_lewis, cohensk_kate, by = "phonetic_id")
+
+cohensk_6 <- cohensk_6[,-1]
+
+cohensk_7 <- inner_join(cohensk_seth, cohensk_kate, by = "phonetic_id")
+
+cohensk_7 <- cohensk_7[,-1]
+
+cohensk_8 <- inner_join(cohensk_seth, cohensk_albert, by = "phonetic_id")
+
+cohensk_8 <- cohensk_8[,-1]
+
+cohensk_9 <- inner_join(cohensk_seth, cohensk_misha, by = "phonetic_id")
+
+cohensk_9 <- cohensk_9[,-1]
+
+#cohensk_10 <- inner_join(cohensk_seth, cohensk_lewis, by = "phonetic_id")
+
+#cohensk_10 <- cohensk_10[,-1] #10 not used, no available data on join- no matches
+
+ckap(data = cohensk_1, weight = c("linear"),
+std.err = c("Cohen"), conf.level = 0.95, R = 0)
+
+ckap(data = cohensk_2, weight = c("linear"),
+std.err = c("Cohen"), conf.level = 0.95, R = 0)
+
+ckap(data = cohensk_3, weight = c("linear"),
+std.err = c("Cohen"), conf.level = 0.95, R = 0)
+
+ckap(data = cohensk_4, weight = c("linear"),
+std.err = c("Cohen"), conf.level = 0.95, R = 0)
+
+ckap(data = cohensk_5, weight = c("linear"),
+std.err = c("Cohen"), conf.level = 0.95, R = 0)
+
+ckap(data = cohensk_6, weight = c("linear"),
+std.err = c("Cohen"), conf.level = 0.95, R = 0)
+
+ckap(data = cohensk_7, weight = c("linear"),
+std.err = c("Cohen"), conf.level = 0.95, R = 0)
+
+ckap(data = cohensk_8, weight = c("linear"),
+std.err = c("Cohen"), conf.level = 0.70, R = 0)
+
+ckap(data = cohensk_9, weight = c("linear"),
+std.err = c("Cohen"), conf.level = 0.82, R = 0)
+
+#ckap(data = cohensk_10, weight = c("linear"),
+std.err = c("Cohen"), conf.level = 0.95, R = 0)
+
+(.73 + .76 + .62 + .70 + .73 + .72 + .70 + .71 +.82)/9
+
+#Sample data: 200 subjects and 5 reponse categories.
+data <- cbind(sample(1:5,200, replace=TRUE),sample(1:5,200, replace=TRUE))
+#A numeric categories*categories matrix with custom weights
+cw <- diag(ncol(matrix(0,5,5)))
+cw[cw!=diag(cw)] <- runif(20,0,1)
+#Cohen's kappa with Fleiss corrected standard error formula
+ckap(data=data, weight="unweighted", std.err="Fleiss", conf.level = 0.95)
+#Weighted kappa with linear weight
+ckap(data=data, weight="linear", conf.level = 0.95)
+#Weighted kappa with custom weights
+ckap(data=data, weight=cw, conf.level = 0.95)
+
+#x-axis is time in days since x-ray
+# c19_firstxray$xray_relative_intubation
+# 
+# #event is intubation
+# c19_firstxray$intubation_TF
+# 
+# #censor lets say is 60 days after x-ray if they have not been intubated yet.
+# c19_firstxray$censor <- c19_firstxray$xray_relative_intubation
+# c19_firstxray$censor <- c19_firstxray$xray_relative_intubation %>% replace_na(60)
+# 
+# albert_table <- c19_firstxray %>% dplyr::select(mrn, xray_relative_intubation, intubation_TF, censor)
+
+#For Abe
+
+```
+
+##Log-rank pairwise tests on quartiles using gt
+```{r}
+library(gt)
+
+hosp_posthoc <- read_csv("hosp_posthoc.csv")
+
+intubation_posthoc <- read_csv("intubation_posthoc.csv")
+
+mortality_posthoc <- read_csv("mortality_posthoc.csv")
+
+hosp_posthoc <- as.data.frame(hosp_posthoc) %>% rename(`Quartiles` = `Duration of Hospitalization Quartiles`)
+
+intubation_posthoc <- as.data.frame(intubation_posthoc) %>% rename(`Quartiles` = `Intubation Quartiles`)
+
+intubation_posthoc$`Mean mRALE score`[3] <- '< 2e-16'
+
+mortality_posthoc <- as.data.frame(mortality_posthoc) %>% rename(`Quartiles` = `Mortality Quartiles`)
+
+mortality_posthoc$X6 <- NULL
+mortality_posthoc$X7 <- NULL
+
+hosp_table <- gt(data = hosp_posthoc) %>%
+  tab_header(
+    title = "Hospital Duration" 
+    ) %>%
+  tab_spanner(
+    label = "AI Metrics",
+    columns = vars(`Fractional Area`, `Maximum Probability`, `Mean Probability`))
+
+hosp_table %>%
+  gtsave(
+    "hosp_table.png", expand = 10,
+  )
+
+mortality_table <- gt(data = mortality_posthoc) %>%
+  tab_header(
+    title = "Mortality" 
+    ) %>%
+  tab_spanner(
+    label = "AI Metrics",
+    columns = vars(`Fractional Area`, `Maximum Probability`, `Mean Probability`))
+
+mortality_table %>%
+  gtsave(
+    "mortality_table.png", expand = 10,
+  )
+
+
+intubation_table <- gt(data = intubation_posthoc) %>%
+  tab_header(
+    title = "Intubation" 
+    ) %>%
+  tab_spanner(
+    label = "AI Metrics",
+    columns = vars(`Fractional Area`, `Maximum Probability`, `Mean Probability`))
+  
+intubation_table %>%
+  gtsave(
+    "intubation_table.png", expand = 10,
+  )
+
+
+
+
+
+
+
+
+
+
+
+```
+##Survival tables in gt
+```{r}
+library(gt)
+
+mrale_mortality <- read_csv("mrale_mortality.csv")
+mrale_intubation <- read_csv("mrale_intubation.csv")
+mrale_hospdur <- read_csv("mrale_hospdur.csv")
+
+mrale_mortality <- as.data.frame(mrale_mortality) %>% rename(`Percent at Risk` = `Percent at Rick`)
+
+mrale_intubation <- as.data.frame(mrale_intubation) %>% rename(`Percent at Risk` = `Percent at Rick`)
+
+mrale_hospdur <- as.data.frame(mrale_hospdur) %>% rename(`Percent at Risk` = `Percent at Rick`)
+
+mrale_mortality_table <- gt(data = mrale_mortality) %>%
+ tab_header(
+    title = "A. Average mRALE Mortality Survival Table" 
+    )
+
+mrale_mortality_table %>% 
+ gtsave(
+    "mrale_mortality_table.png"
+  )
+
+mrale_intubation_table <- gt(data = mrale_intubation) %>%
+ tab_header(
+    title = "B. Average mRALE Intubation Survival Table" 
+    )
+
+mrale_intubation_table %>% 
+ gtsave(
+    "mrale_intubation_table.png"
+  )
+
+mrale_hospdur_table <- gt(data = mrale_hospdur) %>%
+ tab_header(
+    title = "C. Average mRALE Hospital Duration Survival Table" 
+    )
+
+mrale_hospdur_table %>% 
+ gtsave(
+    "mrale_hospdur_table.png"
+  )
+  
+fracarea_mortality <- read_csv("fracarea_mortality.csv")
+fracarea_intubation <- read_csv("fracarea_intubation.csv")
+fracarea_hospdur <- read_csv("fracarea_hospdur.csv")
+
+fracarea_mortality$fracarea_quartile <- NULL
+
+fracarea_mortality <- as.data.frame(fracarea_mortality) %>% rename(`Percent at Risk` = `Percent at Rick`)
+fracarea_intubation <- as.data.frame(fracarea_intubation) %>% rename(`Percent at Risk` = `Percent at Rick`)
+fracarea_hospdur <- as.data.frame(fracarea_hospdur) %>% rename(`Percent at Risk` = `Percent at Rick`)
+
+fracarea_mortality_table <- gt(data = fracarea_mortality) %>%
+ tab_header(
+    title = "D. Fractional Area Mortality Survival Table" 
+    )
+
+fracarea_mortality_table %>% 
+ gtsave(
+    "fracarea_mortality_table.png"
+  )
+
+fracarea_intubation_table <- gt(data = fracarea_intubation) %>%
+ tab_header(
+    title = "E. Fractional Area Intubation Survival Table" 
+    )
+
+fracarea_intubation_table %>% 
+ gtsave(
+    "fracarea_intubation_table.png"
+  )
+
+fracarea_hospdur_table <- gt(data = fracarea_hospdur) %>%
+ tab_header(
+    title = "F. Fractional Area Hospital Duration Survival Table" 
+    )
+
+fracarea_hospdur_table %>% 
+ gtsave(
+    "fracarea_hospdur_table.png"
+  )
+
+meanprob_mortality <- read_csv("meanprob_mortality.csv")
+meanprob_intubation <- read_csv("meanprob_intubation.csv")
+meanprob_hospdur <- read_csv("meanprob_hospdur.csv")
+
+meanprob_mortality <- as.data.frame(meanprob_mortality) %>% rename(`Percent at Risk` = `Percent at Rick`)
+meanprob_intubation <- as.data.frame(meanprob_intubation) %>% rename(`Percent at Risk` = `Percent at Rick`)
+meanprob_hospdur <- as.data.frame(meanprob_hospdur) %>% rename(`Percent at Risk` = `Percent at Rick`)
+
+meanprob_mortality_table <- gt(data = meanprob_mortality) %>%
+ tab_header(
+    title = "G. Mean Probability Mortality Survival Table" 
+    )
+
+meanprob_mortality_table %>% 
+ gtsave(
+    "meanprob_mortality_table.png"
+  )
+
+meanprob_intubation_table <- gt(data = meanprob_intubation) %>%
+ tab_header(
+    title = "H. Mean Probability Intubation Survival Table" 
+    )
+
+meanprob_intubation_table %>% 
+ gtsave(
+    "meanprob_intubation_table.png"
+  )
+
+meanprob_hospdur_table <- gt(data = meanprob_hospdur) %>%
+ tab_header(
+    title = "I. Mean Probability Hospital Duration Survival Table" 
+    )
+
+meanprob_hospdur_table %>% 
+ gtsave(
+    "meanprob_hospdur_table.png"
+  )
+
+maxprob_mortality <- read_csv("maxprob_mortality.csv")
+maxprob_intubation <- read_csv("maxprob_intubation.csv")
+maxprob_hospdur <- read_csv("maxprob_hospdur.csv")
+
+#fracarea_mortality$fracarea_quartile <- NULL
+
+maxprob_mortality <- as.data.frame(maxprob_mortality) %>% rename(`Percent at Risk` = `Percent at Rick`)
+maxprob_intubation <- as.data.frame(maxprob_intubation) %>% rename(`Percent at Risk` = `Percent at Rick`)
+maxprob_hospdur <- as.data.frame(maxprob_hospdur) %>% rename(`Percent at Risk` = `Percent at Rick`)
+
+maxprob_mortality_table <- gt(data = maxprob_mortality) %>%
+ tab_header(
+    title = "J. Maximum Probability Mortality Survival Table" 
+    )
+
+maxprob_mortality_table %>% 
+ gtsave(
+    "maxprob_mortality_table.png"
+  )
+
+maxprob_intubation_table <- gt(data = maxprob_intubation) %>%
+ tab_header(
+    title = "K. Maximum Probability Intubation Survival Table" 
+    )
+
+maxprob_intubation_table %>% 
+ gtsave(
+    "maxprob_intubation_table.png"
+  )
+
+maxprob_hospdur_table <- gt(data = maxprob_hospdur) %>%
+ tab_header(
+    title = "L. Maximum Probability Hospital Duration Survival Table" 
+    )
+
+maxprob_hospdur_table %>% 
+ gtsave(
+    "maxprob_hospdur_table.png"
+  )
+```
