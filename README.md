@@ -1,1 +1,1 @@
-# covid19 with Dr. Daniel's data 
+# Covid-19 data cleaning and Survival analysis 
