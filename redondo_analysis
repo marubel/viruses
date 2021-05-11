@@ -1,0 +1,254 @@
+---
+title: "Redondo_qpcr_analysis"
+author: "Louis J Taylor, Meagan A Rubel"
+date: "2/14/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  dev='svg'
+)
+```
+
+
+```{r libs}
+
+library(dplyr)
+library(ggplot2)
+library(ggbeeswarm)
+library(formattable)
+library(tidyr)
+library(readr)
+
+```
+
+```{r themes}
+theme_ljt_scatter <- theme_bw(base_size = 16) +
+  theme(panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)))
+```
+
+## Read in files
+
+```{r files, echo=TRUE}
+setwd("/media/lorax/users/marubel/07_Redondos")
+
+TZ_Agg_qPCR_Results <- read_csv("TZ_Agg_qPCR_Results.csv")
+CM_Agg_qPCR_Results <- read_csv("CM_Agg_qPCR_Results.csv")
+ET_Agg_qPCR_Results <- read_csv("ET_Agg_qPCR_Results.csv")
+BS_Agg_qPCR_Results <- read_csv("BS_Agg_qPCR_Results.csv")
+
+CM_metadata_redondos <- read_csv("CM_metadata_redondos.csv")
+ET_BS_TZ_metadata <- read_csv("ET_BS_TZ_metadata.csv")
+
+```
+
+
+#Rename Lab ID to field ID
+```{r rename, echo=TRUE}
+TZ_Agg_qPCR_Results <- TZ_Agg_qPCR_Results %>%
+     dplyr::rename(
+        Field_ID = Lab_ID
+    )
+
+BS_Agg_qPCR_Results <- BS_Agg_qPCR_Results %>%
+     rename(
+         Field_ID = Lab_ID
+     )
+
+ET_Agg_qPCR_Results <- ET_Agg_qPCR_Results %>%
+     rename(
+         Field_ID = Lab_ID
+     )
+
+CM_Agg_qPCR_Results <- CM_Agg_qPCR_Results %>%
+     rename(
+         Field_ID = sampleID
+     )
+
+CM_metadata_redondos <- CM_metadata_redondos %>%
+     rename(
+         Field_ID = sampleID
+     )
+```
+
+     
+#select only data from Agg that is qPCR_Sample == Y &
+#select only these columns from this data list: Ct Mean, Lab_ID
+```{r data selection, echo=TRUE}
+
+ET <- ET_Agg_qPCR_Results %>% filter(., qPCR_Sample == "Y")
+ET <- ET %>% select(., "Field_ID", `Ct Mean`)
+
+TZ <- TZ_Agg_qPCR_Results %>% filter(., qPCR_Sample == "Y")
+TZ <- TZ %>% select(., "Field_ID", `Ct Mean`)
+
+BS <- BS_Agg_qPCR_Results %>% filter(., qPCR_Sample == "Y")
+BS <- BS %>% select(., "Field_ID", `Ct Mean`)
+
+CM <- CM_Agg_qPCR_Results %>% filter(., qPCR_Sample == "Y")
+CM <- CM %>% select(., "Field_ID", `Ct Mean`)
+
+#Rename Ct Mean because the space is annoying
+ET <- ET %>%
+     rename(
+        Ct_Mean = `Ct Mean`
+    )
+
+TZ <- TZ %>%
+     rename(
+         Ct_Mean = `Ct Mean`
+     )
+
+BS <- BS %>%
+     rename(
+         Ct_Mean = `Ct Mean`
+     )
+
+CM <- CM %>%
+     rename(
+         CT_Mean = `Ct Mean`
+     )
+
+#Make empty column for merge in ET_BS_TZ_metadata
+ET_BS_TZ_metadata$Ct_Mean <- NA
+
+met1 <- left_join(ET_BS_TZ_metadata, ET, by = "Field_ID","Ct_Mean")
+met2 <- left_join(met1, BS, by = "Field_ID", "Ct_Mean")
+met3 <- left_join(met2, TZ, by = "Field_ID", "Ct_Mean") %>% mutate(Lab_ID = Field_ID)
+
+grep("27.4544830",met2$Ct_Mean.y,fixed = TRUE)
+
+met3$CT_Mean <- coalesce(met3$Ct_Mean.y, met3$Ct_Mean.x.x, met3$Ct_Mean.y.y)
+met3$Ct_Mean.x <- NULL
+met3$Ct_Mean.y <- NULL
+met3$Ct_Mean.x.x <- NULL
+met3$Ct_Mean.y.y <- NULL
+met3$Ct_Mean <- NULL
+
+
+met4 <- met3 %>% filter(., CT_Mean > 0)
+
+#321 samples in my file
+
+#Make empty column for merge in CM_metadata_redondos
+CM_metadata_redondos$CT_Mean <- NA
+CM_metadata_redondos$fixed_country <- "Cameroon"
+
+CMmet1 <- left_join(CM_metadata_redondos, CM, by = "Field_ID","CT_Mean")
+CMmet1$CT_Mean.x <- NULL
+CMmet1 <- CMmet1 %>%
+     rename(
+         CT_Mean = CT_Mean.y
+     )
+CMmet1$CT_Mean_numonly <- as.numeric(CMmet1$CT_Mean)
+CMmet1$Lab_ID <- CMmet1$Field_ID
+
+CMmet2 <- CMmet1 %>% filter(., CT_Mean > 0)
+
+ 
+#Country -> Categorization:Regeneron::str
+met4 <- met4 %>%
+     rename(
+         Country = `Categorization:Regeneron::str`
+     )
+ 
+met4 <- separate(met4, Country, c("fixed_country"), ",", extra = "drop")
+met4$fixed_country <- as.factor(met4$fixed_country)
+
+#Subsistence -> Subject_Information:Subsistence_Practice_Primary::str
+met4 <- met4 %>%
+     rename(
+         Subsistence = `Subject_Information:Subsistence_Practice_Primary::str`
+     )
+
+summary(met4$CT_Mean_numonly)
+options(digits=8)
+met4$CT_Mean_numonly <- as.numeric(met4$CT_Mean)
+
+met4 <- met4 %>%
+     rename(
+         Age = `Subject_Information:Age::num::yr`
+     )
+
+#NAs are undetermined. 321 ET BS TZ samples, 114 Undetermined,206 positive (64)
+
+ # Min. 1st Qu.  Median    Mean 3rd Qu.    Max.    NA's
+#  4.609  25.270  28.249  27.495  32.278  39.860     115
+
+met5 <- met4 %>% select(., "Lab_ID", "fixed_country","Subsistence","CT_Mean", "CT_Mean_numonly", "Age")
+
+met6 <- met5[1:275,]
+
+CMmet3 <- CMmet2 %>% select(., "Lab_ID", "fixed_country","Subsistence","CT_Mean", "CT_Mean_numonly","Age")
+
+#Merge Cameroon and met5 sample data together
+Afr_qPCR <- rbind(met6, CMmet3)
+
+Afr_qPCR$Subsistence[1:94] <- "Agropastoralist"
+Afr_qPCR$Subsistence[252] <- "Agropastoralist"
+
+Afr_qPCR$Subsistence[120] <- "Hunter-Gatherer"
+
+Afr_qPCR$Subsistence[153] <- "Hunter-Gatherer"
+Afr_qPCR$Subsistence[158] <- "Hunter-Gatherer"
+Afr_qPCR$Subsistence[161] <- "Hunter-Gatherer"
+Afr_qPCR$Subsistence[172] <- "Hunter-Gatherer"
+Afr_qPCR$Subsistence[187] <- "Hunter-Gatherer"
+Afr_qPCR$Subsistence[188] <- "Hunter-Gatherer"
+
+Afr_qPCR$Subsistence<- as.factor(Afr_qPCR$Subsistence)
+
+
+Afr_qPCR$Age <- as.numeric(Afr_qPCR$Age)
+#Afr_qPCR$Subsistence <- droplevels(Afr_qPCR$Subsistence)
+
+
+#head(Afr_qPCR)
+
+#Afr_qPCR$Lab_ID_fixed <- ifelse(Afr_qPCR$fixed_country = "Cameroon", Afr_qPCR$Lab_ID, )
+```
+
+
+```{r boxplots, echo = TRUE, fig.height=5,fig.width=8}
+MiSeqsamp <- c("D0901", "D0909", "D0916", "D0040")
+
+sgad <- c("A203", "A724", "A207", "A239")
+
+positives <- c("D0901", "D0909", "D0916", "D0040", 'A720', 'A239', 'A223', 'C698', 'C347', 'C466', 'D0900', 'D0047' , "A203", 'D0895', 'D0916')
+
+negatives <- c('B357','B610','B371','B385','B618','B361','A230','A224','C321','C326','C187','D0049','D0021')
+
+Afr_qPCR <- Afr_qPCR %>%
+    mutate(miseqsamp = ifelse(Lab_ID %in% positives, "Pos",
+                              ifelse(Lab_ID %in% sgad, "SGA",
+                                     ifelse(Lab_ID %in% negatives, "Neg", "ND"))))
+
+#Subsistence
+ggplot(mapping=aes(Afr_qPCR$Subsistence, Afr_qPCR$CT_Mean_numonly)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_quasirandom(aes(shape = Afr_qPCR$miseqsamp, color = Afr_qPCR$miseqsamp, fill = Afr_qPCR$miseqsamp), size = 2) +
+  scale_shape_manual(values= c(18,17,16,21)) +
+  scale_color_manual(values = c("darkgray","red","green","black")) +
+  scale_fill_manual(values = c(NA, NA, NA, "green")) +
+  labs(x = "", y="Ct value", shape = "WGA PCR result", color = "WGA PCR result")+
+  theme_ljt_scatter
+
+#Country
+ggplot(Afr_qPCR, aes(fixed_country, CT_Mean_numonly)) +  
+  geom_boxplot(outlier.shape = NA) +
+  geom_quasirandom(aes(shape = Afr_qPCR$miseqsamp, color = Afr_qPCR$miseqsamp, fill = Afr_qPCR$miseqsamp), size = 2) +
+  scale_shape_manual(values= c(18,17,16,21)) +
+  scale_color_manual(values = c("darkgray","red","green","black")) +
+  scale_fill_manual(values = c(NA, NA, NA, "green")) +
+  labs(x = "", y="Ct value", shape = "WGA PCR result", color = "WGA PCR result", fill = "WGA PCR result")+
+  theme_ljt_scatter
+
+
+```
